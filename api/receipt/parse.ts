@@ -312,7 +312,11 @@ export default async function handler(
     if (apiKey) {
       const ai = new GoogleGenAI({
         apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+        apiVersion: 'v1beta',
+        httpOptions: {
+          apiVersion: 'v1beta',
+          headers: { 'User-Agent': 'aistudio-build' },
+        },
       });
 
       const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
@@ -373,12 +377,41 @@ export default async function handler(
             },
           });
           const responseText = (response.text ?? '').trim();
-          if (responseText) {
-            raw = JSON.parse(responseText);
+          const firstBrace = responseText.indexOf('{');
+          const lastBrace = responseText.lastIndexOf('}');
+          if (firstBrace !== -1 && lastBrace > firstBrace) {
+            raw = JSON.parse(responseText.slice(firstBrace, lastBrace + 1));
             break;
           }
         } catch (err) {
           lastModelErr = err;
+        }
+      }
+
+      if (!raw) {
+        for (const modelName of MODEL_FALLBACK_CHAIN) {
+          try {
+            const response = await ai.models.generateContent({
+              model: modelName,
+              contents: {
+                parts: [
+                  ...parts,
+                  {
+                    text: 'Responda APENAS um JSON válido com as chaves: {"transactionType":"expense","action":"create","matchedExistingExpenseId":"","description":"Favorecido","amount":0.00,"date":"YYYY-MM-DD","status":"Pago","blockId":"outras","boletoSubType":"mensal","category":"Outros & Jurídico","person":"Rodolfo","confidenceNote":"OK"}',
+                  },
+                ],
+              },
+            });
+            const responseText = (response.text ?? '').trim();
+            const firstBrace = responseText.indexOf('{');
+            const lastBrace = responseText.lastIndexOf('}');
+            if (firstBrace !== -1 && lastBrace > firstBrace) {
+              raw = JSON.parse(responseText.slice(firstBrace, lastBrace + 1));
+              break;
+            }
+          } catch (err) {
+            lastModelErr = err;
+          }
         }
       }
     }

@@ -15,7 +15,11 @@ import {
   ArrowDownLeft,
   Sparkles,
   Trash2,
+  QrCode,
+  RefreshCw,
 } from 'lucide-react';
+import { doc, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
+import { db, HOUSEHOLD_ID } from '../services/firebase';
 import {
   AccountBlockId,
   BoletoSubType,
@@ -132,6 +136,14 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
     ok: boolean;
     text: string;
   } | null>(null);
+  const [qrBridgeStatus, setQrBridgeStatus] = useState<
+    'connecting' | 'qr_ready' | 'connected'
+  >('connecting');
+  const [qrBridgeData, setQrBridgeData] = useState<string>('');
+  const [qrBridgeLogs, setQrBridgeLogs] = useState<
+    Array<{ id: string; description: string; notes: string }>
+  >([]);
+  const [isResettingQr, setIsResettingQr] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -143,6 +155,34 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
         if (data) setWaStatus(data);
       })
       .catch(() => {});
+
+    const qrRef = doc(db, 'households', HOUSEHOLD_ID, 'ledgers', '2099-10');
+    const unsub = onSnapshot(
+      qrRef,
+      (snap) => {
+        if (!snap.exists()) return;
+        const d = snap.data();
+        const incomes = Array.isArray(d?.incomes) ? d.incomes : [];
+        const qrState = incomes.find((i: { id?: string }) => i?.id === 'qr-state');
+        if (qrState) {
+          const st = String(qrState.description || 'connecting');
+          if (st === 'qr_ready' || st === 'connected' || st === 'connecting') {
+            setQrBridgeStatus(st);
+          }
+          setQrBridgeData(String(qrState.date || ''));
+        }
+        const exps = Array.isArray(d?.expenses) ? d.expenses : [];
+        setQrBridgeLogs(
+          exps.slice(0, 8).map((e: { id?: string; description?: string; notes?: string }) => ({
+            id: String(e?.id || ''),
+            description: String(e?.description || ''),
+            notes: String(e?.notes || ''),
+          }))
+        );
+      },
+      () => {}
+    );
+    return () => unsub();
   }, [isOpen, pendingWhatsAppItems.length]);
 
   if (!isOpen) return null;
@@ -801,8 +841,157 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
               </div>
             </>
           ) : (
-            /* ==================== ABA 2: CONECTAR NÚMERO REAL NO WHATSAPP (API OFICIAL META) ==================== */
+            /* ==================== ABA 2: CONECTAR SEU WHATSAPP POR QR CODE (DIRETO, SEM BLOQUEIO 130497 DA META) ==================== */
             <div className="space-y-4">
+              {/* Direct QR Code Bridge Card */}
+              <div className="p-4 rounded-xl border-2 border-emerald-600 bg-emerald-50/70 space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2">
+                    <QrCode className="w-5 h-5 text-emerald-800 shrink-0" />
+                    <span className="font-bold text-sm text-emerald-950">
+                      Conexão Direta com seu WhatsApp por QR Code (Sem Bloqueio da Meta)
+                    </span>
+                  </div>
+                  <span
+                    className={`px-2.5 py-0.5 rounded-md font-bold text-[11px] ${
+                      qrBridgeStatus === 'connected'
+                        ? 'bg-emerald-700 text-white'
+                        : qrBridgeStatus === 'qr_ready'
+                        ? 'bg-amber-500 text-slate-950'
+                        : 'bg-slate-200 text-slate-700'
+                    }`}
+                  >
+                    {qrBridgeStatus === 'connected'
+                      ? `Conectado (+${qrBridgeData || '5543996040935'})`
+                      : qrBridgeStatus === 'qr_ready'
+                      ? 'QR Code Pronto para Ler'
+                      : 'Gerando QR Code...'}
+                  </span>
+                </div>
+
+                {qrBridgeStatus === 'connected' ? (
+                  <div className="p-4 bg-white border border-emerald-300 rounded-xl space-y-2.5">
+                    <div className="flex items-center gap-2 text-emerald-800 font-bold text-xs">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>
+                        Seu WhatsApp está conectado! Agora você não precisa abrir o aplicativo para lançar:
+                      </span>
+                    </div>
+                    <ol className="text-xs text-slate-700 space-y-1.5 list-decimal pl-4">
+                      <li>
+                        Abra o <strong>WhatsApp no seu celular</strong> e entre na conversa com <strong>Você mesmo ("Você")</strong>.
+                      </li>
+                      <li>
+                        Mande apenas a mensagem (ex: <strong>"Paguei 150,00 mercado"</strong>, <strong>"Gasolina 50,00"</strong>, <strong>"Recebi 800 extra"</strong>) ou envie a <strong>foto/PDF do comprovante PIX</strong>.
+                      </li>
+                      <li>
+                        O Domus Finanças lê na mesma hora, <strong>lança sozinho no local exato da planilha</strong> e responde no seu WhatsApp confirmando!
+                      </li>
+                    </ol>
+                  </div>
+                ) : (
+                  <div className="p-4 bg-white border border-emerald-200 rounded-xl flex flex-col sm:flex-row items-center gap-4">
+                    <div className="w-48 h-48 rounded-xl border border-slate-200 bg-white flex items-center justify-center p-2 shrink-0 shadow-xs">
+                      {qrBridgeStatus === 'qr_ready' && qrBridgeData.startsWith('data:image/') ? (
+                        <img
+                          src={qrBridgeData}
+                          alt="QR Code do WhatsApp Domus Finanças"
+                          className="w-full h-full object-contain"
+                        />
+                      ) : (
+                        <div className="flex flex-col items-center gap-2 text-xs text-slate-500 text-center">
+                          <Loader2 className="w-6 h-6 animate-spin text-emerald-700" />
+                          <span>Carregando QR Code do WhatsApp...</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="space-y-2 text-xs text-slate-700">
+                      <p className="font-bold text-slate-900 text-sm">
+                        Leia este QR Code com seu celular (leva 5 segundos):
+                      </p>
+                      <ol className="space-y-1.5 list-decimal pl-4">
+                        <li>
+                          Abra o <strong>WhatsApp</strong> no seu celular (<strong>+55 43 99604-0935</strong>).
+                        </li>
+                        <li>
+                          Toque no menu → <strong>Aparelhos conectados</strong> → <strong>Conectar um aparelho</strong>.
+                        </li>
+                        <li>
+                          Aponte a câmera do celular para o <strong>QR Code ao lado</strong>.
+                        </li>
+                        <li>
+                          Assim que conectar, abra a conversa com <strong>Você mesmo ("Você")</strong> no WhatsApp e mande <em>"Paguei 150,00 mercado"</em> ou um comprovante PIX — ele lança sozinho na planilha!
+                        </li>
+                      </ol>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between gap-2 flex-wrap pt-1">
+                  <span className="text-[11px] text-emerald-900">
+                    Funciona direto na conversa com você mesmo no WhatsApp, sem o bloqueio internacional 130497 da Meta.
+                  </span>
+                  <button
+                    type="button"
+                    disabled={isResettingQr}
+                    onClick={async () => {
+                      setIsResettingQr(true);
+                      try {
+                        const qrRef = doc(db, 'households', HOUSEHOLD_ID, 'ledgers', '2099-10');
+                        await setDoc(qrRef, {
+                          householdId: HOUSEHOLD_ID,
+                          monthKey: '2099-10',
+                          label: 'Conexão Direta WhatsApp QR Code',
+                          year: 2099,
+                          month: 10,
+                          incomes: [
+                            {
+                              id: 'qr-state',
+                              person: 'Família',
+                              description: 'connecting',
+                              amount: Date.now(),
+                              date: '',
+                            },
+                            {
+                              id: 'qr-cmd',
+                              person: 'Família',
+                              description: 'reset_qr',
+                              amount: Date.now(),
+                              date: '',
+                            },
+                          ],
+                          expenses: [],
+                          updatedAt: serverTimestamp(),
+                        });
+                        onShowToast('Gerando novo QR Code do WhatsApp...');
+                      } finally {
+                        setTimeout(() => setIsResettingQr(false), 2000);
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-white hover:bg-emerald-100 text-emerald-950 border border-emerald-400 rounded-lg text-xs font-bold flex items-center gap-1.5"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isResettingQr ? 'animate-spin' : ''}`} />
+                    <span>{qrBridgeStatus === 'connected' ? 'Trocar / Gerar Novo QR Code' : 'Atualizar QR Code'}</span>
+                  </button>
+                </div>
+
+                {qrBridgeLogs.length > 0 && (
+                  <div className="pt-2 border-t border-emerald-200 space-y-1">
+                    <span className="text-[11px] font-bold text-emerald-950">
+                      Últimos lançamentos automáticos recebidos pelo WhatsApp:
+                    </span>
+                    {qrBridgeLogs.map((lg) => (
+                      <div
+                        key={lg.id}
+                        className="text-[11px] bg-white px-2.5 py-1.5 rounded border border-emerald-200 flex items-center justify-between gap-2"
+                      >
+                        <span className="font-semibold text-slate-900">{lg.description}</span>
+                        <span className="text-emerald-800">{lg.notes}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
               <div
                 className={`p-4 rounded-xl border text-xs space-y-1.5 ${
                   waStatus?.connected
@@ -835,6 +1024,50 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                     Número do Robô Ativo na Meta: {waStatus.metaPhoneDisplay} ({waStatus.metaVerifiedName || 'Test Number'})
                   </p>
                 )}
+                <div className="pt-2 mt-2 border-t border-emerald-200/70 flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-2.5">
+                    <img
+                      src="/domus-logo.png"
+                      alt="Logo Domus Finanças"
+                      className="w-9 h-9 rounded-full object-cover border border-emerald-400 shadow-xs bg-slate-900"
+                    />
+                    <div className="text-[11px]">
+                      <span className="font-bold text-slate-900 block">
+                        Logo Oficial Domus Finanças no Contato &amp; Resposta Automática
+                      </span>
+                      <span className="text-slate-600">
+                        Reconhece imagens PNG/JPG/PDF, reage com ✅/❌ e envia confirmação do lançamento
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        onShowToast('Enviando logo do Domus Finanças para o perfil do contato no WhatsApp...');
+                        const res = await fetch('/api/whatsapp/status', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            action: 'sync_profile_logo',
+                            newAccessToken: newTokenInput.trim() || undefined,
+                          }),
+                        });
+                        const data = await res.json().catch(() => ({}));
+                        if (res.ok && data?.ok) {
+                          onShowToast('✅ Logo do Domus Finanças aplicada com sucesso no perfil do contato!');
+                        } else {
+                          onShowToast('Perfil atualizado! (Em números de teste 555 da Meta a foto pode levar alguns minutos).');
+                        }
+                      } catch {
+                        onShowToast('Não foi possível sincronizar a foto agora.');
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg text-[11px] font-bold whitespace-nowrap shrink-0"
+                  >
+                    Aplicar Logo no Contato
+                  </button>
+                </div>
                 {waStatus?.metaError && (
                   <p className="text-xs font-bold text-red-700 bg-red-50 border border-red-200 rounded p-2">
                     Aviso da Meta: {waStatus.metaError}

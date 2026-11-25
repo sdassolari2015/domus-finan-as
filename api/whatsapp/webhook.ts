@@ -14,6 +14,7 @@ const FIRESTORE_DATABASE_ID =
   'ai-studio-domuscontrolefin-af87b841-f232-48c0-a854-6751f0583616';
 const HOUSEHOLD_DOC_ID = 'domus_family';
 const DIAGNOSTIC_DOC_KEY = '2099-11';
+const APP_LOGO_PUBLIC_URL = 'https://domus-finan-as.vercel.app/domus-logo.png';
 
 const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/jpeg',
@@ -74,6 +75,7 @@ const MODEL_FALLBACK_CHAIN = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
   'gemini-3.1-flash-lite-preview',
   'gemini-3-flash-preview',
 ];
@@ -100,22 +102,55 @@ function isAllowedMetaMediaUrl(rawUrl: string): boolean {
     const host = parsed.hostname.toLowerCase();
     return (
       host === 'graph.facebook.com' ||
+      host.endsWith('.facebook.com') ||
       host.endsWith('.fbsbx.com') ||
-      host.endsWith('.fbcdn.net')
+      host.endsWith('.fbcdn.net') ||
+      host.endsWith('.whatsapp.net')
     );
   } catch {
     return false;
   }
 }
 
-// Normalizes Brazilian 9-digit mobile numbers so replies work whether Meta expects 13 or 12 digits.
-// Put the 13-digit format FIRST for Brazilian numbers because Meta's test recipient whitelist stores 13 digits (+55 43 99604-0935)
-// and resolves it automatically to the 12-digit wa_id (554396040935)!
+function detectMimeTypeFromMagicBytes(buf: Buffer, fallbackMime: string): string {
+  if (buf.length >= 4) {
+    // PNG: 89 50 4E 47
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+      return 'image/png';
+    }
+    // JPEG: FF D8 FF
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+      return 'image/jpeg';
+    }
+    // PDF: 25 50 44 46 (%PDF)
+    if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
+      return 'application/pdf';
+    }
+    // RIFF....WEBP
+    if (
+      buf.length >= 12 &&
+      buf[0] === 0x52 &&
+      buf[1] === 0x49 &&
+      buf[2] === 0x46 &&
+      buf[3] === 0x46 &&
+      buf[8] === 0x57 &&
+      buf[9] === 0x45 &&
+      buf[10] === 0x42 &&
+      buf[11] === 0x50
+    ) {
+      return 'image/webp';
+    }
+  }
+  const clean = (fallbackMime || 'image/png').toLowerCase().split(';')[0].trim();
+  if (clean === 'image/jpg') return 'image/jpeg';
+  if (ALLOWED_MEDIA_MIME_TYPES.has(clean)) return clean;
+  return 'image/png';
+}
+
 function getCandidateRecipientPhones(rawPhone: string): string[] {
   const digits = rawPhone.replace(/\D/g, '');
   const list: string[] = [];
   if (digits.startsWith('55') && digits.length === 12) {
-    // 13-digit with 9 after DDD first (matches Meta recipient whitelist)
     list.push(`${digits.slice(0, 4)}9${digits.slice(4)}`);
     list.push(digits);
   } else if (digits.startsWith('55') && digits.length === 13 && digits[4] === '9') {
@@ -170,7 +205,11 @@ async function getActiveWhatsAppToken(): Promise<string> {
   return process.env.WHATSAPP_ACCESS_TOKEN?.trim() || '';
 }
 
-async function recordWebhookDiagnostic(summaryText: string, statusText: string): Promise<void> {
+async function recordWebhookDiagnostic(
+  summaryText: string,
+  statusText: string,
+  userMessageNotification?: string
+): Promise<void> {
   try {
     const db = getServerFirestore();
     const diagRef = doc(db, 'households', HOUSEHOLD_DOC_ID, 'ledgers', DIAGNOSTIC_DOC_KEY);
@@ -192,12 +231,15 @@ async function recordWebhookDiagnostic(summaryText: string, statusText: string):
       category: 'Outros & Jurídico',
       isRecurringFixed: false,
       notes: statusText.slice(0, 190),
+      ...(userMessageNotification ? { boletoSubType: 'mensal' } : {}),
     };
 
     await setDoc(diagRef, {
       householdId: HOUSEHOLD_DOC_ID,
       monthKey: DIAGNOSTIC_DOC_KEY,
-      label: 'Diagnóstico Webhook WhatsApp',
+      label: userMessageNotification
+        ? userMessageNotification.slice(0, 500)
+        : 'Diagnóstico Webhook WhatsApp',
       year: 2099,
       month: 11,
       incomes: prevIncomes.slice(0, 10),
@@ -209,9 +251,63 @@ async function recordWebhookDiagnostic(summaryText: string, statusText: string):
   }
 }
 
+// Marks the incoming WhatsApp message as read (2 blue checkmarks) and puts an emoji reaction (✅ / ❌ / ⏳)
+async function sendWhatsAppReadAndReaction(params: {
+  toPhone: string;
+  messageId: string;
+  emoji: string;
+}): Promise<void> {
+  const token = await getActiveWhatsAppToken();
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
+  if (!token || !phoneNumberId || !params.messageId) return;
+
+  // 1. Mark message as read (blue ticks)
+  await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      status: 'read',
+      message_id: params.messageId,
+    }),
+  }).catch(() => {});
+
+  // 2. React directly on the user's message with emoji (✅ or ❌ or ⏳)
+  const candidates = getCandidateRecipientPhones(params.toPhone);
+  for (const candidate of candidates) {
+    if (!/^[0-9]{8,20}$/.test(candidate)) continue;
+    try {
+      const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: candidate,
+          type: 'reaction',
+          reaction: {
+            message_id: params.messageId,
+            emoji: params.emoji,
+          },
+        }),
+      });
+      if (res.ok) break;
+    } catch {
+      // Continue
+    }
+  }
+}
+
 async function sendWhatsAppTextReply(
   toPhone: string,
-  bodyText: string
+  bodyText: string,
+  replyToMessageId?: string
 ): Promise<{ ok: boolean; details: string }> {
   const token = await getActiveWhatsAppToken();
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
@@ -228,19 +324,24 @@ async function sendWhatsAppTextReply(
   for (const candidate of candidates) {
     if (!/^[0-9]{8,20}$/.test(candidate)) continue;
     try {
+      const payload: Record<string, unknown> = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: candidate,
+        type: 'text',
+        text: { body: bodyText.slice(0, 1000) },
+      };
+      if (replyToMessageId) {
+        payload.context = { message_id: replyToMessageId };
+      }
+
       const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          recipient_type: 'individual',
-          to: candidate,
-          type: 'text',
-          text: { body: bodyText.slice(0, 1000) },
-        }),
+        body: JSON.stringify(payload),
       });
       const respText = await res.text();
       logs.push(`${candidate}:${res.status}:${respText.slice(0, 80)}`);
@@ -255,40 +356,147 @@ async function sendWhatsAppTextReply(
   return { ok: false, details: logs.join(' || ') };
 }
 
+// Automatically uploads the Domus Finanças app logo and sets the WhatsApp Business Contact profile photo & description
+async function ensureWhatsAppContactLogoAndProfile(): Promise<void> {
+  try {
+    const token = await getActiveWhatsAppToken();
+    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
+    if (!token || !phoneNumberId) return;
+
+    let profilePictureHandle = '';
+    try {
+      const logoRes = await fetch(APP_LOGO_PUBLIC_URL);
+      if (logoRes.ok) {
+        const logoBuf = Buffer.from(await logoRes.arrayBuffer());
+        let appId = 'app';
+        try {
+          const appRes = await fetch('https://graph.facebook.com/v21.0/app', {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (appRes.ok) {
+            const appJson = (await appRes.json()) as { id?: string };
+            if (appJson.id && /^[0-9]+$/.test(appJson.id)) {
+              appId = appJson.id;
+            }
+          }
+        } catch {
+          // Use 'app' alias
+        }
+
+        const sessionRes = await fetch(
+          `https://graph.facebook.com/v21.0/${appId}/uploads?file_length=${logoBuf.length}&file_type=image/png&file_name=domus-logo.png`,
+          {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        if (sessionRes.ok) {
+          const sessionJson = (await sessionRes.json()) as { id?: string };
+          if (sessionJson.id) {
+            const uploadRes = await fetch(
+              `https://graph.facebook.com/v21.0/${sessionJson.id}`,
+              {
+                method: 'POST',
+                headers: {
+                  Authorization: `OAuth ${token}`,
+                  file_offset: '0',
+                  'Content-Type': 'image/png',
+                },
+                body: new Uint8Array(logoBuf),
+              }
+            );
+            if (uploadRes.ok) {
+              const uploadJson = (await uploadRes.json()) as { h?: string };
+              if (uploadJson.h) {
+                profilePictureHandle = uploadJson.h;
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Proceed with profile text metadata if image upload handle is not available
+    }
+
+    const profilePayload: Record<string, unknown> = {
+      messaging_product: 'whatsapp',
+      about: 'Domus Finanças - Controle Financeiro Familiar',
+      address: 'Paraná, Brasil',
+      description:
+        'Assistente automático do Domus Finanças. Envie comprovantes PIX (PNG, JPG ou PDF) ou mensagens para lançar direto na planilha da família.',
+      vertical: 'PROF_SERVICES',
+      websites: ['https://domus-finan-as.vercel.app'],
+    };
+    if (profilePictureHandle) {
+      profilePayload.profile_picture_handle = profilePictureHandle;
+    }
+
+    await fetch(
+      `https://graph.facebook.com/v21.0/${phoneNumberId}/whatsapp_business_profile`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(profilePayload),
+      }
+    ).catch(() => {});
+  } catch {
+    // Ignore profile update errors
+  }
+}
+
 async function downloadWhatsAppMediaAsBase64(
   mediaId: string
-): Promise<{ base64: string; mimeType: string } | null> {
+): Promise<{ base64: string; mimeType: string } | { error: string }> {
   const token = await getActiveWhatsAppToken();
-  if (!token) return null;
-  if (!/^[a-zA-Z0-9_-]{4,128}$/.test(mediaId)) return null;
-
-  const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!metaRes.ok) return null;
-  const metaJson = (await metaRes.json()) as { url?: string; mime_type?: string };
-  if (!metaJson.url || !isAllowedMetaMediaUrl(metaJson.url)) {
-    return null;
+  if (!token) return { error: 'Token ausente ao baixar mídia' };
+  const cleanId = mediaId.trim();
+  if (!/^[a-zA-Z0-9_.:-]{3,256}$/.test(cleanId)) {
+    return { error: `Media ID inválido: ${cleanId.slice(0, 30)}` };
   }
 
-  const mimeType = (metaJson.mime_type || 'image/jpeg').toLowerCase().split(';')[0].trim();
-  if (!ALLOWED_MEDIA_MIME_TYPES.has(mimeType)) {
-    return null;
+  const metaRes = await fetch(`https://graph.facebook.com/v21.0/${cleanId}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'User-Agent': 'curl/8.5.0',
+    },
+  });
+  if (!metaRes.ok) {
+    const errTxt = await metaRes.text().catch(() => '');
+    return { error: `Meta media lookup HTTP ${metaRes.status}: ${errTxt.slice(0, 80)}` };
+  }
+  const metaJson = (await metaRes.json()) as { url?: string; mime_type?: string };
+  if (!metaJson.url || !isAllowedMetaMediaUrl(metaJson.url)) {
+    return { error: 'URL de mídia inválida retornada pela Meta' };
   }
 
   const fileRes = await fetch(metaJson.url, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'User-Agent': 'curl/8.5.0',
+      Accept: '*/*',
+    },
   });
-  if (!fileRes.ok) return null;
-
-  const arrayBuffer = await fileRes.arrayBuffer();
-  if (arrayBuffer.byteLength > 8 * 1024 * 1024) {
-    return null;
+  if (!fileRes.ok) {
+    return { error: `Download binário da mídia falhou HTTP ${fileRes.status}` };
   }
 
+  const arrayBuffer = await fileRes.arrayBuffer();
+  if (arrayBuffer.byteLength === 0 || arrayBuffer.byteLength > 10 * 1024 * 1024) {
+    return { error: `Tamanho de arquivo inválido (${arrayBuffer.byteLength} bytes)` };
+  }
+
+  const buffer = Buffer.from(arrayBuffer);
+  const detectedMime = detectMimeTypeFromMagicBytes(
+    buffer,
+    metaJson.mime_type || 'image/png'
+  );
+
   return {
-    base64: Buffer.from(arrayBuffer).toString('base64'),
-    mimeType: mimeType === 'image/jpg' ? 'image/jpeg' : mimeType,
+    base64: buffer.toString('base64'),
+    mimeType: detectedMime,
   };
 }
 
@@ -305,6 +513,21 @@ function normalizeText(str: string): string {
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .trim();
+}
+
+function parseFlexibleAmount(val: unknown): number {
+  if (typeof val === 'number' && Number.isFinite(val) && val > 0) {
+    return Math.round(val * 100) / 100;
+  }
+  if (typeof val === 'string' && val.trim()) {
+    const extracted = extractAmountFromText(val);
+    if (extracted > 0) return extracted;
+    const direct = Number(val.replace(/[^\d.,-]/g, '').replace(',', '.'));
+    if (Number.isFinite(direct) && direct > 0) {
+      return Math.round(direct * 100) / 100;
+    }
+  }
+  return 0;
 }
 
 function extractAmountFromText(rawText: string): number {
@@ -473,12 +696,25 @@ function parsePortugueseFinancialTextFallback(params: {
   };
 }
 
+function extractJsonObject(rawText: string): string | null {
+  const trimmed = rawText.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
+  }
+  return null;
+}
+
 async function generateWithFallback(
   ai: GoogleGenAI,
   parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
   systemInstruction: string
 ): Promise<string> {
   let lastErr: unknown;
+
+  // Pass 1: Structured JSON Schema on v1beta across all candidate models
   for (const modelName of MODEL_FALLBACK_CHAIN) {
     try {
       const response = await ai.models.generateContent({
@@ -518,11 +754,34 @@ async function generateWithFallback(
         },
       });
       const text = (response.text ?? '').trim();
-      if (text) return text;
+      const jsonBlock = extractJsonObject(text);
+      if (jsonBlock) return jsonBlock;
     } catch (err) {
       lastErr = err;
     }
   }
+
+  // Pass 2: Schema-free JSON extraction fallback in case any model rejected responseSchema
+  for (const modelName of MODEL_FALLBACK_CHAIN) {
+    try {
+      const fallbackParts = [
+        ...parts,
+        {
+          text: `${systemInstruction}\nResponda APENAS um objeto JSON válido com as chaves: {"transactionType":"expense","action":"create","matchedExistingExpenseId":"","description":"Nome do favorecido ou conta","amount":0.00,"date":"YYYY-MM-DD","status":"Pago","blockId":"outras","boletoSubType":"mensal","category":"Outros & Jurídico","person":"Rodolfo"}`,
+        },
+      ];
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: { parts: fallbackParts },
+      });
+      const text = (response.text ?? '').trim();
+      const jsonBlock = extractJsonObject(text);
+      if (jsonBlock) return jsonBlock;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
   throw lastErr || new Error('Gemini unavailable');
 }
 
@@ -532,7 +791,7 @@ async function parseAndSaveDirectToFirestore(params: {
   imageMimeType?: string;
   senderName: string;
 }) {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   const db = getServerFirestore();
 
   let activeMonthKey = '2026-11';
@@ -575,12 +834,18 @@ async function parseAndSaveDirectToFirestore(params: {
     : 'Rodolfo';
 
   let raw: Record<string, unknown> | null = null;
+  let geminiErrMsg = '';
 
   if (apiKey) {
     try {
+      // CRITICAL: Use apiVersion: 'v1beta' so multimodal PNG/JPG/PDF + systemInstruction + responseSchema work on @google/genai v3.6.1
       const ai = new GoogleGenAI({
         apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+        apiVersion: 'v1beta',
+        httpOptions: {
+          apiVersion: 'v1beta',
+          headers: { 'User-Agent': 'aistudio-build' },
+        },
       });
 
       const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
@@ -601,20 +866,25 @@ async function parseAndSaveDirectToFirestore(params: {
           `Contas PENDENTES existentes no mês: ${JSON.stringify(
             existingExpenses.filter((e) => e.status === 'Pendente')
           )}`,
-          params.text ? `Mensagem: "${params.text}"` : 'Extraia os dados do comprovante PIX.',
+          params.text
+            ? `Mensagem/Legenda: "${params.text}"`
+            : 'Extraia o valor (R$), favorecido/descrição e data deste comprovante PIX ou boleto.',
         ].join('\n'),
       });
 
-      const systemInstruction = `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise o comprovante PIX ou mensagem e classifique no local exato.
-- transactionType: "income" (entrada/recebido) ou "expense" (saída/pago).
+      const systemInstruction = `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise a imagem PNG/JPG/PDF do comprovante PIX ou mensagem e extraia o lançamento exato.
+- transactionType: "income" (entrada/recebido) ou "expense" (saída/pago/transferido).
 - action: "mark_existing_paid" se corresponder a uma conta pendente existente (informe o id em matchedExistingExpenseId), ou "create" se for novo.
+- amount: valor numérico em reais (ex: 150.50). Procure por "Valor", "R$", "Total", "Valor pago" ou "Valor da transferência" na imagem.
+- description: nome do recebedor/favorecido ou descrição curta da despesa.
 - blockId: id do cartão/conta se mencionado (ex: nubank, bradesco, santander, caixa, sicredi, quero_quero), ou "outras" para PIX/boletos/gastos gerais.
-- boletoSubType: "fixa" (luz, água, internet, fixas mensais), "variavel" (parcelado, consórcio, boleto parcelado) ou "mensal" (mercado, farmácia, gasolina, gastos do mês).
+- boletoSubType: "fixa" (luz, água, internet, fixas mensais), "variavel" (parcelado, consórcio, boleto parcelado) ou "mensal" (mercado, farmácia, gasolina, PIX e gastos do mês).
 - Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`;
 
       const jsonText = await generateWithFallback(ai, parts, systemInstruction);
       raw = JSON.parse(jsonText);
-    } catch {
+    } catch (err) {
+      geminiErrMsg = err instanceof Error ? err.message : String(err);
       raw = null;
     }
   }
@@ -631,7 +901,11 @@ async function parseAndSaveDirectToFirestore(params: {
   }
 
   if (!raw) {
-    throw new Error('Could not parse message or receipt');
+    throw new Error(
+      geminiErrMsg
+        ? `Falha ao ler comprovante (${geminiErrMsg.slice(0, 90)})`
+        : 'Não foi possível identificar os dados do comprovante'
+    );
   }
 
   const transactionType = raw.transactionType === 'income' ? 'income' : 'expense';
@@ -660,15 +934,15 @@ async function parseAndSaveDirectToFirestore(params: {
     : 'Outros & Jurídico';
   const person =
     raw.person === 'Rodolfo' || raw.person === 'Viviane' ? raw.person : defaultPerson;
-  const amountNum = Number(raw.amount);
+  const parsedAmt = parseFlexibleAmount(raw.amount);
   const amount =
-    Number.isFinite(amountNum) && amountNum > 0
-      ? Math.round(amountNum * 100) / 100
+    parsedAmt > 0
+      ? parsedAmt
       : matchedExpense && matchedExpense.amount > 0
       ? matchedExpense.amount
       : 0;
   const description = String(
-    matchedExpense ? matchedExpense.description : raw.description || 'Lançamento via WhatsApp'
+    matchedExpense ? matchedExpense.description : raw.description || 'Comprovante PIX'
   ).slice(0, 75);
   const date =
     typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date)
@@ -691,7 +965,7 @@ async function parseAndSaveDirectToFirestore(params: {
       : 'Boletos e Fixas → Gastos Mensais';
 
   if (amount <= 0) {
-    throw new Error('Zero amount');
+    throw new Error('Valor R$ 0,00 ou não identificado na imagem');
   }
 
   let savedToCloud = false;
@@ -807,7 +1081,6 @@ export default async function handler(
         for (const change of changes) {
           const value = change?.value;
 
-          // Log outgoing delivery statuses (sent / delivered / failed)
           const statuses = Array.isArray(value?.statuses) ? value.statuses : [];
           for (const st of statuses) {
             const stStatus = String(st?.status || '');
@@ -824,8 +1097,14 @@ export default async function handler(
           const messages = Array.isArray(value?.messages) ? value.messages : [];
           const contacts = Array.isArray(value?.contacts) ? value.contacts : [];
 
+          if (messages.length > 0) {
+            // Ensure the WhatsApp Business Profile has the Domus Finanças Logo and info
+            ensureWhatsAppContactLogoAndProfile().catch(() => {});
+          }
+
           for (const msg of messages) {
             const fromPhone = String(msg?.from || '').replace(/\D/g, '');
+            const incomingMsgId = String(msg?.id || '');
             if (!fromPhone) continue;
 
             const contact = contacts.find((c: { wa_id?: string }) => c?.wa_id === msg?.from);
@@ -835,38 +1114,87 @@ export default async function handler(
             let textContent = '';
             let mediaBase64: string | undefined;
             let mediaMimeType: string | undefined;
+            let mediaDownloadError = '';
 
             if (msgType === 'text') {
               textContent = String(msg?.text?.body || '').trim();
             } else if (msgType === 'image') {
               textContent = String(msg?.image?.caption || '').trim();
               const mediaId = String(msg?.image?.id || '');
+              // Immediate visual interaction on the user's PNG/JPG message (blue ticks + hourglass reaction)
+              await sendWhatsAppReadAndReaction({
+                toPhone: fromPhone,
+                messageId: incomingMsgId,
+                emoji: '⏳',
+              });
               const media = await downloadWhatsAppMediaAsBase64(mediaId);
-              if (media) {
+              if ('base64' in media) {
                 mediaBase64 = media.base64;
                 mediaMimeType = media.mimeType;
+              } else {
+                mediaDownloadError = media.error;
               }
             } else if (msgType === 'document') {
               textContent = String(msg?.document?.caption || '').trim();
               const mediaId = String(msg?.document?.id || '');
+              await sendWhatsAppReadAndReaction({
+                toPhone: fromPhone,
+                messageId: incomingMsgId,
+                emoji: '⏳',
+              });
               const media = await downloadWhatsAppMediaAsBase64(mediaId);
-              if (media) {
+              if ('base64' in media) {
                 mediaBase64 = media.base64;
                 mediaMimeType = media.mimeType;
+              } else {
+                mediaDownloadError = media.error;
               }
             } else {
+              await sendWhatsAppReadAndReaction({
+                toPhone: fromPhone,
+                messageId: incomingMsgId,
+                emoji: '⚠️',
+              });
+              const unsupportedMsg =
+                '⚠️ *Domus Finanças:* Formato não suportado. Envie uma imagem (PNG/JPG), PDF de comprovante PIX ou mensagem de texto com o valor (ex: *"Paguei 150,00 mercado"*).';
               const replyRes = await sendWhatsAppTextReply(
                 fromPhone,
-                'Domus Finanças: Envie a foto/PDF de um comprovante PIX ou uma mensagem com o valor (ex: "Paguei 150,00 mercado" ou "Recebi 800 extra").'
+                unsupportedMsg,
+                incomingMsgId
               );
               await recordWebhookDiagnostic(
                 `De ${fromPhone} (${msgType})`,
-                `Reply: ${replyRes.details}`
+                `Reply: ${replyRes.details}`,
+                unsupportedMsg
               );
               continue;
             }
 
-            if (!textContent && !mediaBase64) continue;
+            if (!textContent && !mediaBase64) {
+              await sendWhatsAppReadAndReaction({
+                toPhone: fromPhone,
+                messageId: incomingMsgId,
+                emoji: '❌',
+              });
+              const dlErrMsg = [
+                '❌ *Deu errado ao baixar o comprovante no Domus Finanças.*',
+                mediaDownloadError ? `• *Detalhe:* ${mediaDownloadError}` : '',
+                '💡 Tente reenviar a imagem PNG/JPG ou escreva o valor na legenda (ex: *"Paguei 150,00 mercado"*).',
+              ]
+                .filter(Boolean)
+                .join('\n');
+              const replyRes = await sendWhatsAppTextReply(
+                fromPhone,
+                dlErrMsg,
+                incomingMsgId
+              );
+              await recordWebhookDiagnostic(
+                `ERR MÍDIA ${fromPhone}`,
+                `${mediaDownloadError || 'Sem conteúdo'} | Meta:${replyRes.details}`,
+                dlErrMsg
+              );
+              continue;
+            }
 
             try {
               const parsed = await parseAndSaveDirectToFirestore({
@@ -876,33 +1204,61 @@ export default async function handler(
                 senderName,
               });
 
+              // React with ✅ on the user's message and mark read!
+              await sendWhatsAppReadAndReaction({
+                toPhone: fromPhone,
+                messageId: incomingMsgId,
+                emoji: '✅',
+              });
+
               const replySummary = [
-                '✅ *Lançado na Planilha Domus Finanças!*',
+                '✅ *Lançamento Confirmado no Domus Finanças!*',
                 `• *Tipo:* ${parsed.transactionType === 'income' ? 'Entrada / Receita' : 'Saída / Pagamento'}`,
                 `• *Descrição:* ${parsed.description}`,
                 `• *Valor:* ${formatBRLServer(parsed.amount)}`,
                 `• *Local:* ${parsed.destinationLabel}`,
                 `• *Situação:* ${parsed.status}`,
                 parsed.savedToCloud
-                  ? '☁️ *Já gravado automaticamente na nuvem da família!*'
+                  ? '☁️ *Já gravado automaticamente na planilha da família!*'
                   : '',
               ]
                 .filter(Boolean)
                 .join('\n');
 
-              const replyRes = await sendWhatsAppTextReply(fromPhone, replySummary);
-              await recordWebhookDiagnostic(
-                `OK ${fromPhone}: ${parsed.description} (${formatBRLServer(parsed.amount)})`,
-                `Cloud:${parsed.savedToCloud} | Meta:${replyRes.details}`
-              );
-            } catch (err) {
               const replyRes = await sendWhatsAppTextReply(
                 fromPhone,
-                '⚠️ Recebi sua mensagem, mas não consegui identificar o valor. Envie por exemplo: "Paguei 150,00 mercado", "Recebi 800 extra" ou a foto com o valor na legenda.'
+                replySummary,
+                incomingMsgId
               );
               await recordWebhookDiagnostic(
-                `ERR ${fromPhone}: "${textContent.slice(0, 40)}"`,
-                `Err:${err instanceof Error ? err.message : 'parse'} | Meta:${replyRes.details}`
+                `OK ${fromPhone}: ${parsed.description} (${formatBRLServer(parsed.amount)})`,
+                `Cloud:${parsed.savedToCloud} | Mime:${mediaMimeType || 'text'} | Meta:${replyRes.details}`,
+                replySummary
+              );
+            } catch (err) {
+              // React with ❌ on the user's message so they immediately see it failed!
+              await sendWhatsAppReadAndReaction({
+                toPhone: fromPhone,
+                messageId: incomingMsgId,
+                emoji: '❌',
+              });
+
+              const errDetail = err instanceof Error ? err.message : 'valor não identificado';
+              const errorReply = [
+                '❌ *Deu errado ao lançar no Domus Finanças.*',
+                `• *Motivo:* ${errDetail}`,
+                '💡 *Como resolver:* Envie um comprovante PIX nítido (PNG, JPG ou PDF) ou escreva o valor na legenda (ex: *"Paguei 150,00 mercado"* ou *"Recebi 800 extra"*).',
+              ].join('\n');
+
+              const replyRes = await sendWhatsAppTextReply(
+                fromPhone,
+                errorReply,
+                incomingMsgId
+              );
+              await recordWebhookDiagnostic(
+                `ERR ${fromPhone}: "${textContent.slice(0, 35) || mediaMimeType || 'img'}"`,
+                `Err:${errDetail} | Meta:${replyRes.details}`,
+                errorReply
               );
             }
           }

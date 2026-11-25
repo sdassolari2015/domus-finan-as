@@ -5,19 +5,19 @@ export interface AppReleaseNote {
   changes: string[];
 }
 
-export const CURRENT_APP_VERSION = '2.9.4';
+export const CURRENT_APP_VERSION = '2.9.6';
 export const PERMANENT_APP_LINK = 'https://domus-finan-as.vercel.app';
-export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.4';
+export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.6';
 
 export const APP_RELEASES: AppReleaseNote[] = [
   {
-    version: '2.9.4',
+    version: '2.9.6',
     releaseDate: 'Versão Atual',
-    title: 'Lançamento Automático por Comprovante PIX & Conexão Oficial WhatsApp',
+    title: 'Leitura de Comprovantes PNG no WhatsApp, Foto de Perfil & Retorno Automático',
     changes: [
-      'Novo botão "PIX / WhatsApp": Envie print, foto ou PDF de qualquer comprovante PIX (ou digite uma mensagem rápida de saída/entrada) e o sistema lê e lança automaticamente no local exato da planilha (Entradas, Cartões/Contas, Despesas Fixas, Gastos Mensais ou Despesas Variáveis).',
-      'Baixa Automática de Contas: Quando o comprovante PIX corresponde a uma conta pendente do mês, o sistema identifica e marca automaticamente como Pago.',
-      'Webhook Oficial do WhatsApp Business (API Meta): Conectado direto ao Google Cloud Firestore com suporte aos números de 12 e 13 dígitos do Brasil e motor financeiro à prova de falhas.',
+      'Leitura de Comprovantes PNG/JPG/PDF no WhatsApp: Corrigido o motor Gemini v1beta com detecção binária de PNG para reconhecer e lançar comprovantes em imagem enviados no WhatsApp.',
+      'Interação Automática do Contato no WhatsApp: Ao enviar mensagem ou comprovante, o contato marca como lido (✓✓), reage na mensagem com ✅ (lançado) ou ❌ (erro) e envia a confirmação detalhada.',
+      'Logo do Domus Finanças no Contato: Sincronização automática da logo oficial do app no perfil WhatsApp Business + opção de QR Code direto.',
     ],
   },
   {

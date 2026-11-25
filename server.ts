@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
 import path from 'path';
+import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
   parseFinancialReceiptOrMessage,
@@ -523,6 +524,18 @@ async function startServer() {
 
   app.listen(port, '0.0.0.0', () => {
     console.log(`Domus Financeiro server running on http://0.0.0.0:${port}`);
+
+    const startWaBridge = () => {
+      const workerPath = path.resolve(__dirname, 'server', 'waBridgeWorker.mjs');
+      const child = spawn(process.execPath, [workerPath], {
+        stdio: 'inherit',
+        env: process.env,
+      });
+      child.on('exit', () => {
+        setTimeout(startWaBridge, 5000);
+      });
+    };
+    startWaBridge();
   });
 }
 

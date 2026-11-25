@@ -13,6 +13,7 @@ const FIRESTORE_DATABASE_ID =
   'ai-studio-domuscontrolefin-af87b841-f232-48c0-a854-6751f0583616';
 const HOUSEHOLD_DOC_ID = 'domus_family';
 const DIAGNOSTIC_DOC_KEY = '2099-11';
+const APP_LOGO_PUBLIC_URL = 'https://domus-finan-as.vercel.app/domus-logo.png';
 
 function getServerFirestore() {
   const app =
@@ -85,7 +86,6 @@ async function getEffectiveAccessToken(overrideToken?: string): Promise<{
     return { token: overrideToken.trim(), diagExpenses, diagIncomes };
   }
 
-  // Check if there is a newer encrypted token saved in Firestore 2099-11
   const tokenEntry = diagIncomes.find((i) => i?.id === 'wa-token-enc');
   if (tokenEntry && typeof tokenEntry.date === 'string') {
     const decrypted = decryptTokenFromCloud(tokenEntry.date);
@@ -135,6 +135,111 @@ async function saveEncryptedTokenToCloud(
   }
 }
 
+async function syncWhatsAppBusinessProfileLogo(
+  token: string,
+  phoneNumberId: string
+): Promise<{ ok: boolean; pictureUploaded: boolean; details: string }> {
+  let profilePictureHandle = '';
+  let details = '';
+
+  try {
+    const logoRes = await fetch(APP_LOGO_PUBLIC_URL);
+    if (logoRes.ok) {
+      const logoBuf = Buffer.from(await logoRes.arrayBuffer());
+      let appId = 'app';
+      try {
+        const appRes = await fetch('https://graph.facebook.com/v21.0/app', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (appRes.ok) {
+          const appJson = (await appRes.json()) as { id?: string };
+          if (appJson.id && /^[0-9]+$/.test(appJson.id)) {
+            appId = appJson.id;
+          }
+        }
+      } catch {
+        // Fallback to 'app'
+      }
+
+      const sessionRes = await fetch(
+        `https://graph.facebook.com/v21.0/${appId}/uploads?file_length=${logoBuf.length}&file_type=image/png&file_name=domus-logo.png`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      if (sessionRes.ok) {
+        const sessionJson = (await sessionRes.json()) as { id?: string };
+        if (sessionJson.id) {
+          const uploadRes = await fetch(
+            `https://graph.facebook.com/v21.0/${sessionJson.id}`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `OAuth ${token}`,
+                file_offset: '0',
+                'Content-Type': 'image/png',
+              },
+              body: new Uint8Array(logoBuf),
+            }
+          );
+          if (uploadRes.ok) {
+            const uploadJson = (await uploadRes.json()) as { h?: string };
+            if (uploadJson.h) {
+              profilePictureHandle = uploadJson.h;
+            }
+          } else {
+            details = `Upload handle HTTP ${uploadRes.status}`;
+          }
+        }
+      } else {
+        details = `Session HTTP ${sessionRes.status}`;
+      }
+    }
+  } catch (err) {
+    details = err instanceof Error ? err.message : 'Logo fetch error';
+  }
+
+  const profilePayload: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    about: 'Domus Finanças - Controle Financeiro Familiar',
+    address: 'Paraná, Brasil',
+    description:
+      'Assistente automático do Domus Finanças. Envie comprovantes PIX (PNG, JPG ou PDF) ou mensagens para lançar direto na planilha da família.',
+    vertical: 'PROF_SERVICES',
+    websites: ['https://domus-finan-as.vercel.app'],
+  };
+  if (profilePictureHandle) {
+    profilePayload.profile_picture_handle = profilePictureHandle;
+  }
+
+  try {
+    const profRes = await fetch(
+      `https://graph.facebook.com/v21.0/${phoneNumberId}/whatsapp_business_profile`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(profilePayload),
+      }
+    );
+    const profJson = await profRes.text().catch(() => '');
+    return {
+      ok: profRes.ok,
+      pictureUploaded: Boolean(profilePictureHandle),
+      details: profJson.slice(0, 140) || details,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      pictureUploaded: false,
+      details: err instanceof Error ? err.message : 'Profile update error',
+    };
+  }
+}
+
 function getCandidatePhones(rawPhone: string): string[] {
   const digits = rawPhone.replace(/\D/g, '');
   const list: string[] = [];
@@ -181,12 +286,10 @@ export default async function handler(
       });
     }
 
-    // If user pasted a new token directly in the app, verify and persist it encrypted in Firestore
     if (overrideToken && overrideToken.length > 20) {
       await saveEncryptedTokenToCloud(overrideToken, diagExpenses);
     }
 
-    // Subscribe WABA to webhook automatically
     const wabaId =
       process.env.WHATSAPP_BUSINESS_ACCOUNT_ID?.trim() || '1460969489540812';
     if (/^[0-9]{6,25}$/.test(wabaId)) {
@@ -194,6 +297,16 @@ export default async function handler(
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       }).catch(() => {});
+    }
+
+    // Sync Domus Finanças Logo and Business Profile on the WhatsApp contact
+    const profileSync = await syncWhatsAppBusinessProfileLogo(token, phoneNumberId);
+    if (req.body?.action === 'sync_profile_logo') {
+      return res.status(200).json({
+        ok: profileSync.ok,
+        pictureUploaded: profileSync.pictureUploaded,
+        details: profileSync.details,
+      });
     }
 
     const rawTo =
@@ -216,7 +329,6 @@ export default async function handler(
 
       let candidateDelivered = false;
 
-      // 1. Try direct text message
       try {
         const textRes = await fetch(
           `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
@@ -232,7 +344,7 @@ export default async function handler(
               to: candidate,
               type: 'text',
               text: {
-                body: '✅ *Domus Finanças conectado ao seu WhatsApp!*\n\nAgora você já pode enviar:\n• Fotos ou PDFs de comprovantes PIX\n• Mensagens como: *"Paguei 150,00 mercado"* ou *"Recebi 800 extra"*',
+                body: '✅ *Domus Finanças conectado ao seu WhatsApp!*\n\nAgora você já pode enviar:\n• Fotos (PNG/JPG) ou PDFs de comprovantes PIX\n• Mensagens como: *"Paguei 150,00 mercado"* ou *"Recebi 800 extra"*',
               },
             }),
           }
@@ -259,7 +371,6 @@ export default async function handler(
         });
       }
 
-      // 2. Also send hello_world template
       try {
         const tplRes = await fetch(
           `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
@@ -303,6 +414,7 @@ export default async function handler(
 
     return res.status(200).json({
       ok: deliveredAny,
+      profileSync,
       candidates,
       attempts,
     });
@@ -339,6 +451,8 @@ export default async function handler(
             headers: { Authorization: `Bearer ${token}` },
           }).catch(() => {});
         }
+        // Also ensure profile logo & description are synced in background
+        syncWhatsAppBusinessProfileLogo(token, phoneNumberId).catch(() => {});
       } else {
         metaTokenValid = false;
         metaError =
