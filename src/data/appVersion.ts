@@ -120,6 +120,10 @@ export async function applyInPlaceAppUpdate(newVersion: string): Promise<void> {
   setAcknowledgedVersion(newVersion);
   try {
     if ('caches' in window) {
+      const keys = await caches.keys();
+      for (const k of keys) {
+        await caches.delete(k);
+      }
       const cache = await caches.open(STANDALONE_CACHE_NAME);
       const refreshUrls = [
         '/standalone/index.html',
@@ -129,12 +133,12 @@ export async function applyInPlaceAppUpdate(newVersion: string): Promise<void> {
       ];
       for (const u of refreshUrls) {
         try {
-          const res = await fetch(u, { cache: 'no-store' });
+          const res = await fetch(`${u}?t=${Date.now()}`, { cache: 'no-store' });
           if (res && res.status === 200 && !res.redirected) {
             await cache.put(u, res);
           }
         } catch {
-          // Keep cached copy if offline
+          // Ignore if offline
         }
       }
     }

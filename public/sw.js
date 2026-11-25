@@ -130,45 +130,37 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
       (async () => {
         const cache = await caches.open(CACHE_NAME);
-        const cachedStandaloneShell = await cache.match('/standalone/index.html');
-        const cachedAppJs = await cache.match('/standalone/app.js');
 
-        // When opened as a standalone app / browser tab (outside AI Studio preview iframe),
-        // serve the pre-compiled production bundle immediately from Cache Storage (0.01s)
-        // so the app ALWAYS opens even when AI Studio is completely closed!
-        if (
-          request.destination !== 'iframe' &&
-          cachedStandaloneShell &&
-          cachedAppJs
-        ) {
-          event.waitUntil(refreshStandaloneBundleInBackground(cache));
-          return cachedStandaloneShell;
-        }
-
-        // Otherwise (first visit or inside AI Studio preview iframe), try network with 1.8s timeout
+        // Try network first with a fast 2.2s timeout so new versions from Vercel / GitHub
+        // appear immediately without needing to reinstall, and fall back to Cache Storage when offline
         try {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 1800);
-          const netRes = await fetch(request, { signal: controller.signal });
+          const timer = setTimeout(() => controller.abort(), 2200);
+          const netRes = await fetch(request, {
+            cache: 'no-store',
+            signal: controller.signal,
+          });
           clearTimeout(timer);
 
           if (netRes && netRes.status === 200 && !netRes.redirected) {
             const htmlText = await netRes.clone().text();
             if (htmlText.includes('DOMUS_STANDALONE_BUNDLE_OK')) {
+              await cache.put('/index.html', netRes.clone());
               event.waitUntil(refreshStandaloneBundleInBackground(cache));
               return netRes;
             }
           }
         } catch {
-          // Network failed or timed out because AI Studio is closed
+          // Offline or server asleep -> serve cached standalone bundle immediately
         }
 
+        const cachedIndex = await cache.match('/index.html');
+        if (cachedIndex) {
+          return cachedIndex;
+        }
+        const cachedStandaloneShell = await cache.match('/standalone/index.html');
         if (cachedStandaloneShell) {
           return cachedStandaloneShell;
-        }
-        const fallbackIndex = await cache.match('/index.html');
-        if (fallbackIndex) {
-          return fallbackIndex;
         }
         return fetch(request);
       })()

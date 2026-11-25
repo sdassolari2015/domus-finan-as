@@ -1,10 +1,10 @@
 {
-  "version": "2.9.0",
+  "version": "2.9.1",
   "releaseDate": "Versão Atual",
-  "title": "Lançamento Automático por Comprovante PIX & Conexão Oficial WhatsApp",
+  "title": "Domínio Oficial Vercel 24h + Atualização Automática no Notebook & Webhook WhatsApp",
   "changes": [
-    "Novo botão 'PIX / WhatsApp': Envie print, foto ou PDF de qualquer comprovante PIX (ou digite uma mensagem rápida de saída/entrada) e o sistema lê e lança automaticamente no local exato da planilha.",
-    "Baixa Automática de Contas: Quando o comprovante PIX corresponde a uma conta pendente do mês, o sistema identifica e marca automaticamente como Pago.",
-    "Webhook Oficial do WhatsApp Business (API Meta): Pronto para conectar um número real do WhatsApp via Settings > Secrets e responder confirmando cada lançamento."
+    "O aplicativo instalado no notebook agora conecta direto ao servidor oficial da Vercel (https://domus-finan-as.vercel.app) quando há internet, buscando e aplicando toda nova versão automaticamente sem precisar reinstalar.",
+    "Webhook Oficial do WhatsApp ativo e validado em https://domus-finan-as.vercel.app/api/whatsapp/webhook.",
+    "Botão 'PIX / WhatsApp' no topo do sistema para envio rápido de comprovantes PIX (foto, print ou PDF) e mensagens com lançamento automático no local exato."
   ]
 }
