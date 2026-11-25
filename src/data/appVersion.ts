@@ -5,10 +5,9 @@ export interface AppReleaseNote {
   changes: string[];
 }
 
-export const CURRENT_APP_VERSION = '2.9.0';
-export const PERMANENT_APP_LINK =
-  'https://ais-dev-icbuyg3kso5guk72psgmub-309615828273.us-east1.run.app';
-export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.0';
+export const CURRENT_APP_VERSION = '2.9.1';
+export const PERMANENT_APP_LINK = 'https://domus-finan-as.vercel.app';
+export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.1';
 
 export const APP_RELEASES: AppReleaseNote[] = [
   {

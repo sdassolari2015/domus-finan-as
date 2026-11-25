@@ -137,10 +137,7 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
   if (!isOpen) return null;
 
   const effectiveBlocks = getEffectiveBlocks(ledger);
-  const webhookUrl =
-    typeof window !== 'undefined' && window.location.origin.startsWith('http')
-      ? `${window.location.origin}/api/whatsapp/webhook`
-      : 'https://ais-pre-icbuyg3kso5guk72psgmub-309615828273.us-east1.run.app/api/whatsapp/webhook';
+  const webhookUrl = 'https://domus-finan-as.vercel.app/api/whatsapp/webhook';
 
   const readFileAsAttachment = (file: File) => {
     const allowed = [

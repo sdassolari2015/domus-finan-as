@@ -74,19 +74,18 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     };
   }, []);
 
-  // Primary direct link (current active origin so it matches the exact domain the user is logged into)
-  const primaryMobileLink =
+  // Always prefer the permanent Vercel production domain for mobile & other computers
+  const primaryMobileLink = PERMANENT_APP_LINK;
+
+  // Secondary shared link
+  const sharedPublicLink =
     typeof window !== 'undefined' &&
     window.location.origin.startsWith('http') &&
     !window.location.origin.includes('localhost') &&
-    !window.location.origin.includes('127.0.0.1')
+    !window.location.origin.includes('127.0.0.1') &&
+    !window.location.origin.includes('vercel.app')
       ? window.location.origin
-      : PERMANENT_APP_LINK;
-
-  // Secondary shared link (ais-pre)
-  const sharedPublicLink = primaryMobileLink.includes('://ais-dev-')
-    ? primaryMobileLink.replace('://ais-dev-', '://ais-pre-')
-    : 'https://ais-dev-icbuyg3kso5guk72psgmub-309615828273.us-east1.run.app';
+      : 'https://domus-finan-as.vercel.app';
 
   const handleCopyPermanentLink = async () => {
     try {

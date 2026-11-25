@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { parseFinancialReceiptOrMessage } from '../../server/receiptParser';
+import { GoogleGenAI, Type } from '@google/genai';
 
 const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/jpeg',
@@ -9,6 +9,30 @@ const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/heic',
   'application/pdf',
 ]);
+
+const ALLOWED_CATEGORIES = [
+  'Consórcios & Patrimônio',
+  'Financeiro & Cartões',
+  'Moradia & Financiamento',
+  'Utilidades (Luz & Água)',
+  'Transporte & Veículos',
+  'Lazer & Clube',
+  'Internet & Telefonia',
+  'Educação & Filhos',
+  'Associações & Saúde',
+  'Assinaturas & Serviços',
+  'Outros & Jurídico',
+] as const;
+
+const DEFAULT_BLOCKS = [
+  { id: 'bradesco', shortName: 'Bradesco', fullTitle: 'Cartão Bradesco - Débito em Conta', group: 'cartao_conta' },
+  { id: 'santander', shortName: 'Santander', fullTitle: 'Cartão Santander - Débito em Conta', group: 'cartao_conta' },
+  { id: 'caixa', shortName: 'Caixa', fullTitle: 'Conta Caixa - Débito em Conta', group: 'cartao_conta' },
+  { id: 'quero_quero', shortName: 'Quero Quero', fullTitle: 'Cartão Quero Quero - Direto na Loja', group: 'cartao_conta' },
+  { id: 'nubank', shortName: 'NuBank', fullTitle: 'Cartão NuBank - Débito em Conta', group: 'cartao_conta' },
+  { id: 'sicredi', shortName: 'Sicredi', fullTitle: 'Cartão Sicredi Viviane - Débito em Conta', group: 'cartao_conta' },
+  { id: 'outras', shortName: 'Boletos e Fixas', fullTitle: 'Outras Despesas - Boletos e Fixas', group: 'boletos_pix' },
+];
 
 function safeCompareStrings(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'utf8');
@@ -101,6 +125,81 @@ function formatBRLServer(val: number): string {
   });
 }
 
+async function parseMessageInWebhook(params: {
+  text?: string;
+  imageBase64?: string;
+  imageMimeType?: string;
+  defaultPerson?: string;
+}) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY not configured');
+  }
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
+  if (params.imageBase64 && params.imageMimeType) {
+    parts.push({
+      inlineData: {
+        mimeType: params.imageMimeType,
+        data: params.imageBase64,
+      },
+    });
+  }
+  parts.push({
+    text: `Data de hoje: ${todayIso}. Remetente: ${params.defaultPerson || 'Família'}. Blocos: ${JSON.stringify(DEFAULT_BLOCKS)}. Mensagem: ${params.text || 'Comprovante PIX'}`,
+  });
+
+  const response = await ai.models.generateContent({
+    model: 'gemini-4-hydrogen',
+    contents: { parts },
+    config: {
+      systemInstruction: `Classifique o comprovante PIX ou mensagem financeira da família (Rodolfo e Viviane) em JSON. Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          transactionType: { type: Type.STRING },
+          description: { type: Type.STRING },
+          amount: { type: Type.NUMBER },
+          date: { type: Type.STRING },
+          status: { type: Type.STRING },
+          blockId: { type: Type.STRING },
+          boletoSubType: { type: Type.STRING },
+          category: { type: Type.STRING },
+          person: { type: Type.STRING },
+        },
+        required: ['transactionType', 'description', 'amount', 'status', 'blockId', 'boletoSubType'],
+      },
+    },
+  });
+
+  const parsed = JSON.parse((response.text ?? '{}').trim());
+  const isIncome = parsed.transactionType === 'income';
+  const blockObj = DEFAULT_BLOCKS.find((b) => b.id === parsed.blockId);
+  const destinationLabel = isIncome
+    ? `Visão Geral → Entradas (${parsed.person || 'Família'})`
+    : parsed.blockId && parsed.blockId !== 'outras' && blockObj
+    ? `Cartões e Contas → ${blockObj.shortName}`
+    : parsed.boletoSubType === 'fixa'
+    ? 'Boletos e Fixas → Despesas Fixas'
+    : parsed.boletoSubType === 'variavel'
+    ? 'Boletos e Fixas → Despesas Variáveis'
+    : 'Boletos e Fixas → Gastos Mensais';
+
+  return {
+    transactionType: isIncome ? 'income' : 'expense',
+    description: String(parsed.description || 'Lançamento PIX').slice(0, 75),
+    amount: Number(parsed.amount) || 0,
+    status: parsed.status === 'Pendente' ? 'Pendente' : 'Pago',
+    destinationLabel,
+  };
+}
+
 export default async function handler(
   req: {
     method?: string;
@@ -178,7 +277,7 @@ export default async function handler(
             if (!textContent && !mediaBase64) continue;
 
             try {
-              const parsed = await parseFinancialReceiptOrMessage({
+              const parsed = await parseMessageInWebhook({
                 text: textContent || undefined,
                 imageBase64: mediaBase64,
                 imageMimeType: mediaMimeType,
