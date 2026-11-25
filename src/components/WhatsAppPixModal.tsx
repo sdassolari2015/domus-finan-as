@@ -126,6 +126,7 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
   const [waStatus, setWaStatus] = useState<WhatsAppServerStatus | null>(null);
   const [copiedWebhook, setCopiedWebhook] = useState(false);
   const [testPhoneInput, setTestPhoneInput] = useState('5543996040935');
+  const [newTokenInput, setNewTokenInput] = useState('');
   const [isSendingTest, setIsSendingTest] = useState(false);
   const [testResultMsg, setTestResultMsg] = useState<{
     ok: boolean;
@@ -366,13 +367,25 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
       const res = await fetch('/api/whatsapp/status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: cleanPhone }),
+        body: JSON.stringify({
+          to: cleanPhone,
+          newAccessToken: newTokenInput.trim() || undefined,
+        }),
       });
       const data = await res.json();
+      // Refresh status banner
+      fetch('/api/whatsapp/status')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((st) => {
+          if (st) setWaStatus(st);
+        })
+        .catch(() => {});
+
       if (data?.ok) {
+        setNewTokenInput('');
         setTestResultMsg({
           ok: true,
-          text: 'Mensagem de teste enviada com sucesso pela API da Meta! Verifique seu WhatsApp.',
+          text: 'Token atualizado e mensagem de teste enviada com sucesso pela Meta! Verifique seu WhatsApp.',
         });
         onShowToast('Mensagem de teste enviada para seu WhatsApp!');
       } else {
@@ -829,11 +842,18 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                 )}
               </div>
 
-              {/* Test Send Direct to WhatsApp */}
+              {/* Test Send Direct to WhatsApp & Instant Token Update */}
               <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-2.5">
                 <label className="block text-xs font-bold text-slate-900">
-                  Testar Envio de Mensagem para seu WhatsApp Agora
+                  Atualizar Token da Meta e Testar no seu WhatsApp Agora
                 </label>
+                <input
+                  type="password"
+                  value={newTokenInput}
+                  onChange={(e) => setNewTokenInput(e.target.value)}
+                  placeholder="Se o token expirou, cole aqui o novo Token da Meta (EAA...) para atualizar sem ir na Vercel"
+                  className="w-full px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg"
+                />
                 <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                   <input
                     type="text"
@@ -856,7 +876,7 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                     ) : (
                       <>
                         <Send className="w-3.5 h-3.5" />
-                        <span>Testar no Meu WhatsApp</span>
+                        <span>{newTokenInput.trim() ? 'Salvar Token e Testar' : 'Testar no Meu WhatsApp'}</span>
                       </>
                     )}
                   </button>

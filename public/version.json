@@ -1,10 +1,10 @@
 {
-  "version": "2.9.3",
+  "version": "2.9.4",
   "releaseDate": "Versão Atual",
   "title": "Lançamento Automático por Comprovante PIX & Conexão Oficial WhatsApp",
   "changes": [
     "Novo botão \"PIX / WhatsApp\": Envie print, foto ou PDF de qualquer comprovante PIX (ou digite uma mensagem rápida de saída/entrada) e o sistema lê e lança automaticamente no local exato da planilha.",
     "Baixa Automática de Contas: Quando o comprovante PIX corresponde a uma conta pendente do mês, o sistema identifica e marca automaticamente como Pago.",
-    "Integração Oficial do WhatsApp Business (Meta Cloud API) sincronizada diretamente com o Google Cloud Firestore Lite e recarga automática de versão no Notebook e Celular."
+    "Atualização de Token da Meta direto pelo aplicativo (criptografado com AES-256-GCM) sem precisar editar variáveis na Vercel."
   ]
 }

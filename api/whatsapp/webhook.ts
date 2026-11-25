@@ -127,6 +127,49 @@ function getCandidateRecipientPhones(rawPhone: string): string[] {
   return Array.from(new Set(list));
 }
 
+function decryptTokenFromCloud(payload: string): string | null {
+  try {
+    const secret =
+      process.env.GEMINI_API_KEY?.trim() ||
+      process.env.WHATSAPP_VERIFY_TOKEN?.trim() ||
+      '';
+    if (!secret || !payload) return null;
+    const key = crypto.createHash('sha256').update(secret).digest();
+    const parts = payload.split('.');
+    if (parts.length !== 3) return null;
+    const iv = Buffer.from(parts[0], 'base64');
+    const tag = Buffer.from(parts[1], 'base64');
+    const enc = Buffer.from(parts[2], 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
+    return dec.toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
+async function getActiveWhatsAppToken(): Promise<string> {
+  try {
+    const db = getServerFirestore();
+    const snap = await getDoc(
+      doc(db, 'households', HOUSEHOLD_DOC_ID, 'ledgers', DIAGNOSTIC_DOC_KEY)
+    );
+    if (snap.exists() && Array.isArray(snap.data()?.incomes)) {
+      const entry = snap
+        .data()
+        .incomes.find((i: { id?: string }) => i?.id === 'wa-token-enc');
+      if (entry && typeof entry.date === 'string') {
+        const dec = decryptTokenFromCloud(entry.date);
+        if (dec && dec.length > 20) return dec;
+      }
+    }
+  } catch {
+    // Fallback to env var
+  }
+  return process.env.WHATSAPP_ACCESS_TOKEN?.trim() || '';
+}
+
 async function recordWebhookDiagnostic(summaryText: string, statusText: string): Promise<void> {
   try {
     const db = getServerFirestore();
@@ -134,6 +177,8 @@ async function recordWebhookDiagnostic(summaryText: string, statusText: string):
     const snap = await getDoc(diagRef);
     const prevExpenses =
       snap.exists() && Array.isArray(snap.data()?.expenses) ? snap.data().expenses : [];
+    const prevIncomes =
+      snap.exists() && Array.isArray(snap.data()?.incomes) ? snap.data().incomes : [];
 
     const newEntry = {
       id: `diag-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -155,7 +200,7 @@ async function recordWebhookDiagnostic(summaryText: string, statusText: string):
       label: 'Diagnóstico Webhook WhatsApp',
       year: 2099,
       month: 11,
-      incomes: [],
+      incomes: prevIncomes.slice(0, 10),
       expenses: [newEntry, ...prevExpenses].slice(0, 20),
       updatedAt: serverTimestamp(),
     });
@@ -168,8 +213,8 @@ async function sendWhatsAppTextReply(
   toPhone: string,
   bodyText: string
 ): Promise<{ ok: boolean; details: string }> {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN?.trim();
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim();
+  const token = await getActiveWhatsAppToken();
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
   if (!token || !phoneNumberId) {
     return { ok: false, details: 'Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID' };
   }
@@ -213,7 +258,7 @@ async function sendWhatsAppTextReply(
 async function downloadWhatsAppMediaAsBase64(
   mediaId: string
 ): Promise<{ base64: string; mimeType: string } | null> {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN?.trim();
+  const token = await getActiveWhatsAppToken();
   if (!token) return null;
   if (!/^[a-zA-Z0-9_-]{4,128}$/.test(mediaId)) return null;
 
