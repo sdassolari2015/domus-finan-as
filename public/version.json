@@ -1,0 +1,10 @@
+{
+  "version": "2.9.0",
+  "releaseDate": "Versão Atual",
+  "title": "Lançamento Automático por Comprovante PIX & Conexão Oficial WhatsApp",
+  "changes": [
+    "Novo botão 'PIX / WhatsApp': Envie print, foto ou PDF de qualquer comprovante PIX (ou digite uma mensagem rápida de saída/entrada) e o sistema lê e lança automaticamente no local exato da planilha.",
+    "Baixa Automática de Contas: Quando o comprovante PIX corresponde a uma conta pendente do mês, o sistema identifica e marca automaticamente como Pago.",
+    "Webhook Oficial do WhatsApp Business (API Meta): Pronto para conectar um número real do WhatsApp via Settings > Secrets e responder confirmando cada lançamento."
+  ]
+}

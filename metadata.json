@@ -1,0 +1,6 @@
+{
+  "name": "Domus — Controle Financeiro Familiar",
+  "description": "Sistema de gestão de contas pessoais e saúde financeira residencial com separação por cartões, boletos, entradas e relatórios visuais por categoria.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

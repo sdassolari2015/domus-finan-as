@@ -1,0 +1,113 @@
+{
+  "entities": {
+    "HouseholdWorkspace": {
+      "title": "HouseholdWorkspace",
+      "description": "Stores the active month selection, synchronization metadata, and monthly ledgers for the family financial workspace.",
+      "type": "object",
+      "properties": {
+        "householdId": {
+          "type": "string",
+          "description": "Unique identifier of the household workspace.",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "activeMonthKey": {
+          "type": "string",
+          "description": "The currently active month key in YYYY-MM format.",
+          "maxLength": 16,
+          "minLength": 7,
+          "pattern": "^[0-9]{4}-[0-9]{2}$"
+        },
+        "lastAction": {
+          "type": "string",
+          "description": "Description of the last saved transaction or update.",
+          "maxLength": 200,
+          "minLength": 1
+        },
+        "ledgers": {
+          "type": "array",
+          "description": "Bounded list of monthly financial ledgers (up to 60 months)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last save operation."
+        }
+      },
+      "required": ["householdId", "activeMonthKey", "lastAction", "ledgers", "updatedAt"]
+    },
+    "MonthLedger": {
+      "title": "MonthLedger",
+      "description": "Stores an individual monthly financial sheet with family incomes and expenses.",
+      "type": "object",
+      "properties": {
+        "householdId": {
+          "type": "string",
+          "description": "Parent household identifier.",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "monthKey": {
+          "type": "string",
+          "description": "Month identifier in YYYY-MM format.",
+          "maxLength": 16,
+          "minLength": 7,
+          "pattern": "^[0-9]{4}-[0-9]{2}$"
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-readable month label in Portuguese.",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "year": {
+          "type": "number",
+          "description": "Calendar year."
+        },
+        "month": {
+          "type": "number",
+          "description": "Calendar month (1 to 12)."
+        },
+        "incomes": {
+          "type": "array",
+          "description": "List of monthly income entries."
+        },
+        "expenses": {
+          "type": "array",
+          "description": "List of monthly expense entries."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last modification."
+        }
+      },
+      "required": [
+        "householdId",
+        "monthKey",
+        "label",
+        "year",
+        "month",
+        "incomes",
+        "expenses",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/households/{householdId}": {
+      "schema": {
+        "$ref": "#/entities/HouseholdWorkspace"
+      },
+      "description": "Root workspace document storing the active month, last action, and monthly ledgers."
+    },
+    "/households/{householdId}/ledgers/{monthKey}": {
+      "schema": {
+        "$ref": "#/entities/MonthLedger"
+      },
+      "description": "Individual monthly financial ledger documents."
+    }
+  }
+}

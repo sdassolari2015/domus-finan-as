@@ -1,0 +1,117 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAuthorizedHousehold(householdId) {
+      return isValidId(householdId) && householdId == 'domus_family';
+    }
+
+    function isValidHouseholdWorkspace(data) {
+      return data.keys().hasAll(['householdId', 'activeMonthKey', 'lastAction', 'ledgers', 'updatedAt'])
+        && data.keys().hasOnly(['householdId', 'activeMonthKey', 'lastAction', 'ledgers', 'updatedAt'])
+        && data.householdId is string
+        && data.householdId.size() >= 1
+        && data.householdId.size() <= 64
+        && data.householdId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.activeMonthKey is string
+        && data.activeMonthKey.size() >= 7
+        && data.activeMonthKey.size() <= 16
+        && data.activeMonthKey.matches('^[0-9]{4}-[0-9]{2}$')
+        && data.lastAction is string
+        && data.lastAction.size() >= 1
+        && data.lastAction.size() <= 200
+        && data.ledgers is list
+        && data.ledgers.size() >= 1
+        && data.ledgers.size() <= 60
+        && data.ledgers[0] is map
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMonthLedger(data) {
+      return data.keys().hasAll(['householdId', 'monthKey', 'label', 'year', 'month', 'incomes', 'expenses', 'updatedAt'])
+        && data.keys().hasOnly(['householdId', 'monthKey', 'label', 'year', 'month', 'incomes', 'expenses', 'generatedFrom', 'completedInstallmentsFromPrev', 'updatedAt'])
+        && data.householdId is string
+        && data.householdId.size() >= 1
+        && data.householdId.size() <= 64
+        && data.householdId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.monthKey is string
+        && data.monthKey.size() >= 7
+        && data.monthKey.size() <= 16
+        && data.monthKey.matches('^[0-9]{4}-[0-9]{2}$')
+        && data.label is string
+        && data.label.size() >= 1
+        && data.label.size() <= 64
+        && data.year is number
+        && data.year >= 2000
+        && data.year <= 2100
+        && data.month is number
+        && data.month >= 1
+        && data.month <= 12
+        && data.incomes is list
+        && data.incomes.size() <= 100
+        && (data.incomes.size() == 0 || data.incomes[0] is map)
+        && data.expenses is list
+        && data.expenses.size() <= 300
+        && (data.expenses.size() == 0 || data.expenses[0] is map)
+        && (!('generatedFrom' in data) || (data.generatedFrom is string && data.generatedFrom.size() <= 64))
+        && (!('completedInstallmentsFromPrev' in data) || (data.completedInstallmentsFromPrev is list && data.completedInstallmentsFromPrev.size() <= 50))
+        && data.updatedAt is timestamp;
+    }
+
+    match /households/{householdId} {
+      allow get: if isAuthorizedHousehold(householdId);
+
+      allow create: if isAuthorizedHousehold(householdId)
+        && isValidHouseholdWorkspace(incoming())
+        && incoming().householdId == householdId
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAuthorizedHousehold(householdId)
+        && isValidHouseholdWorkspace(incoming())
+        && incoming().householdId == existing().householdId
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['activeMonthKey', 'lastAction', 'ledgers', 'updatedAt']);
+
+      match /ledgers/{monthKey} {
+        allow get: if isAuthorizedHousehold(householdId) && isValidId(monthKey);
+
+        allow list: if isAuthorizedHousehold(householdId)
+          && resource.data.householdId == 'domus_family';
+
+        allow create: if isAuthorizedHousehold(householdId)
+          && isValidId(monthKey)
+          && isValidMonthLedger(incoming())
+          && incoming().householdId == householdId
+          && incoming().monthKey == monthKey
+          && incoming().updatedAt == request.time;
+
+        allow update: if isAuthorizedHousehold(householdId)
+          && isValidId(monthKey)
+          && isValidMonthLedger(incoming())
+          && incoming().householdId == existing().householdId
+          && incoming().monthKey == existing().monthKey
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['label', 'year', 'month', 'incomes', 'expenses', 'generatedFrom', 'completedInstallmentsFromPrev', 'updatedAt']);
+
+        allow delete: if isAuthorizedHousehold(householdId)
+          && isValidId(monthKey)
+          && existing().householdId == 'domus_family';
+      }
+    }
+  }
+}
