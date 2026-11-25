@@ -1,10 +1,31 @@
+import { initializeApp, getApps } from 'firebase/app';
+import { getFirestore, doc, getDoc } from 'firebase/firestore/lite';
+
+const FIREBASE_PROJECT_ID = 'nimble-might-65wls';
+const FIRESTORE_DATABASE_ID =
+  'ai-studio-domuscontrolefin-af87b841-f232-48c0-a854-6751f0583616';
+const HOUSEHOLD_DOC_ID = 'domus_family';
+const DIAGNOSTIC_DOC_KEY = '2099-11';
+
+function getServerFirestore() {
+  const app =
+    getApps().length > 0
+      ? getApps()[0]
+      : initializeApp({ projectId: FIREBASE_PROJECT_ID });
+  return getFirestore(app, FIRESTORE_DATABASE_ID);
+}
+
 function getCandidatePhones(rawPhone: string): string[] {
   const digits = rawPhone.replace(/\D/g, '');
-  const list = [digits];
+  const list: string[] = [];
   if (digits.startsWith('55') && digits.length === 12) {
     list.push(`${digits.slice(0, 4)}9${digits.slice(4)}`);
+    list.push(digits);
   } else if (digits.startsWith('55') && digits.length === 13 && digits[4] === '9') {
+    list.push(digits);
     list.push(`${digits.slice(0, 4)}${digits.slice(5)}`);
+  } else {
+    list.push(digits);
   }
   return Array.from(new Set(list));
 }
@@ -53,6 +74,8 @@ export default async function handler(
     for (const candidate of candidates) {
       if (!/^[0-9]{8,20}$/.test(candidate)) continue;
 
+      let candidateDelivered = false;
+
       // 1. Try direct text message (works when 24h customer care window is open)
       try {
         const textRes = await fetch(
@@ -84,6 +107,7 @@ export default async function handler(
         });
         if (textRes.ok) {
           deliveredAny = true;
+          candidateDelivered = true;
         }
       } catch (err) {
         attempts.push({
@@ -95,7 +119,7 @@ export default async function handler(
         });
       }
 
-      // 2. Also send hello_world template if text message was not accepted
+      // 2. Also send hello_world template to ensure the conversation window opens
       try {
         const tplRes = await fetch(
           `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
@@ -126,9 +150,14 @@ export default async function handler(
         });
         if (tplRes.ok) {
           deliveredAny = true;
+          candidateDelivered = true;
         }
       } catch {
         // Ignore template error
+      }
+
+      if (candidateDelivered) {
+        break;
       }
     }
 
@@ -172,6 +201,25 @@ export default async function handler(
     }
   }
 
+  let recentLogs: Array<{ summary: string; details: string }> = [];
+  try {
+    const db = getServerFirestore();
+    const diagSnap = await getDoc(
+      doc(db, 'households', HOUSEHOLD_DOC_ID, 'ledgers', DIAGNOSTIC_DOC_KEY)
+    );
+    if (diagSnap.exists() && Array.isArray(diagSnap.data()?.expenses)) {
+      recentLogs = diagSnap
+        .data()
+        .expenses.slice(0, 6)
+        .map((e: { description?: string; notes?: string }) => ({
+          summary: String(e?.description || ''),
+          details: String(e?.notes || ''),
+        }));
+    }
+  } catch {
+    // Ignore diagnostic read errors
+  }
+
   return res.status(200).json({
     connected: hasAccessToken && hasPhoneNumberId && metaTokenValid !== false,
     hasAccessToken,
@@ -183,6 +231,7 @@ export default async function handler(
     metaPhoneDisplay,
     metaVerifiedName,
     metaError,
+    recentLogs,
     pendingInboxCount: 0,
     webhookPath: '/api/whatsapp/webhook',
   });

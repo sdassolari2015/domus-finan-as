@@ -1,4 +1,4 @@
-const CACHE_NAME = 'domus-standalone-cache-v2.9.2';
+const CACHE_NAME = 'domus-standalone-cache-v2.9.3';
 
 const PRECACHE_URLS = [
   '/standalone/index.html',

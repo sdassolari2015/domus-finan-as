@@ -1,9 +1,17 @@
 import crypto from 'crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore, doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  setDoc,
+  serverTimestamp,
+} from 'firebase/firestore/lite';
 
+const FIREBASE_PROJECT_ID = 'nimble-might-65wls';
+const FIRESTORE_DATABASE_ID =
+  'ai-studio-domuscontrolefin-af87b841-f232-48c0-a854-6751f0583616';
 const HOUSEHOLD_DOC_ID = 'domus_family';
 const DIAGNOSTIC_DOC_KEY = '2099-11';
 
@@ -71,8 +79,11 @@ const MODEL_FALLBACK_CHAIN = [
 ];
 
 function getServerFirestore() {
-  const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
-  return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  const app =
+    getApps().length > 0
+      ? getApps()[0]
+      : initializeApp({ projectId: FIREBASE_PROJECT_ID });
+  return getFirestore(app, FIRESTORE_DATABASE_ID);
 }
 
 function safeCompareStrings(a: string, b: string): boolean {
@@ -97,16 +108,21 @@ function isAllowedMetaMediaUrl(rawUrl: string): boolean {
   }
 }
 
-// Normalizes Brazilian 9-digit mobile numbers so replies work whether Meta expects 12 or 13 digits
+// Normalizes Brazilian 9-digit mobile numbers so replies work whether Meta expects 13 or 12 digits.
+// Put the 13-digit format FIRST for Brazilian numbers because Meta's test recipient whitelist stores 13 digits (+55 43 99604-0935)
+// and resolves it automatically to the 12-digit wa_id (554396040935)!
 function getCandidateRecipientPhones(rawPhone: string): string[] {
   const digits = rawPhone.replace(/\D/g, '');
-  const list = [digits];
+  const list: string[] = [];
   if (digits.startsWith('55') && digits.length === 12) {
-    // Also try 13-digit version with 9 after DDD: 55 + DD + 9 + 8digits
+    // 13-digit with 9 after DDD first (matches Meta recipient whitelist)
     list.push(`${digits.slice(0, 4)}9${digits.slice(4)}`);
+    list.push(digits);
   } else if (digits.startsWith('55') && digits.length === 13 && digits[4] === '9') {
-    // Also try 12-digit version without the 9
+    list.push(digits);
     list.push(`${digits.slice(0, 4)}${digits.slice(5)}`);
+  } else {
+    list.push(digits);
   }
   return Array.from(new Set(list));
 }
@@ -120,7 +136,7 @@ async function recordWebhookDiagnostic(summaryText: string, statusText: string):
       snap.exists() && Array.isArray(snap.data()?.expenses) ? snap.data().expenses : [];
 
     const newEntry = {
-      id: `diag-${Date.now()}`,
+      id: `diag-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       description: `${new Date().toISOString().slice(11, 19)} | ${summaryText}`.slice(0, 120),
       dueDate: '2099-11-30',
       currentInstallment: null,
@@ -163,10 +179,7 @@ async function sendWhatsAppTextReply(
 
   const candidates = getCandidateRecipientPhones(toPhone);
   const logs: string[] = [];
-  let anySuccess = false;
 
-  // Send to all candidate formats (both 12-digit and 13-digit for Brazilian numbers)
-  // so whichever matches Meta's allowed test recipient list and active WhatsApp ID delivers!
   for (const candidate of candidates) {
     if (!/^[0-9]{8,20}$/.test(candidate)) continue;
     try {
@@ -185,16 +198,16 @@ async function sendWhatsAppTextReply(
         }),
       });
       const respText = await res.text();
-      logs.push(`${candidate}:${res.status}:${respText.slice(0, 90)}`);
+      logs.push(`${candidate}:${res.status}:${respText.slice(0, 80)}`);
       if (res.ok) {
-        anySuccess = true;
+        return { ok: true, details: logs.join(' || ') };
       }
     } catch (err) {
       logs.push(`${candidate}:ERR:${err instanceof Error ? err.message : 'fetch'}`);
     }
   }
 
-  return { ok: anySuccess, details: logs.join(' || ') };
+  return { ok: false, details: logs.join(' || ') };
 }
 
 async function downloadWhatsAppMediaAsBase64(
@@ -636,7 +649,6 @@ async function parseAndSaveDirectToFirestore(params: {
     throw new Error('Zero amount');
   }
 
-  // Persist directly into the main household document's `ledgers` array in Google Cloud Firestore!
   let savedToCloud = false;
   try {
     if (rawLedgers.length > 0) {
@@ -749,6 +761,21 @@ export default async function handler(
         const changes = Array.isArray(entry?.changes) ? entry.changes : [];
         for (const change of changes) {
           const value = change?.value;
+
+          // Log outgoing delivery statuses (sent / delivered / failed)
+          const statuses = Array.isArray(value?.statuses) ? value.statuses : [];
+          for (const st of statuses) {
+            const stStatus = String(st?.status || '');
+            const stRecipient = String(st?.recipient_id || '');
+            const stErrors = Array.isArray(st?.errors) ? JSON.stringify(st.errors) : '';
+            if (stStatus === 'failed' || stErrors) {
+              await recordWebhookDiagnostic(
+                `STATUS ${stStatus.toUpperCase()} p/ ${stRecipient}`,
+                stErrors || 'Falha de entrega reportada pela Meta'
+              );
+            }
+          }
+
           const messages = Array.isArray(value?.messages) ? value.messages : [];
           const contacts = Array.isArray(value?.contacts) ? value.contacts : [];
 

@@ -5,13 +5,13 @@ export interface AppReleaseNote {
   changes: string[];
 }
 
-export const CURRENT_APP_VERSION = '2.9.2';
+export const CURRENT_APP_VERSION = '2.9.3';
 export const PERMANENT_APP_LINK = 'https://domus-finan-as.vercel.app';
-export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.2';
+export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.3';
 
 export const APP_RELEASES: AppReleaseNote[] = [
   {
-    version: '2.9.2',
+    version: '2.9.3',
     releaseDate: 'Versão Atual',
     title: 'Lançamento Automático por Comprovante PIX & Conexão Oficial WhatsApp',
     changes: [

@@ -65,6 +65,20 @@ export const AppUpdateBannerModal: React.FC<AppUpdateBannerModalProps> = ({
       const remote = await checkRemoteVersionJson();
       if (!mounted || !remote) return;
       setLatestRelease(remote);
+      if (remote.version !== CURRENT_APP_VERSION) {
+        setHasPendingUpdate(true);
+        try {
+          const reloadKey = `domus_autoreload_${remote.version}`;
+          if (!sessionStorage.getItem(reloadKey)) {
+            sessionStorage.setItem(reloadKey, '1');
+            await applyInPlaceAppUpdate(remote.version);
+            window.location.reload();
+            return;
+          }
+        } catch {
+          // Ignore sessionStorage errors
+        }
+      }
       const ack = getAcknowledgedVersion();
       if (ack !== remote.version) {
         setHasPendingUpdate(true);
@@ -72,7 +86,7 @@ export const AppUpdateBannerModal: React.FC<AppUpdateBannerModalProps> = ({
     };
 
     void verifyVersion();
-    const timer = window.setInterval(verifyVersion, 45000);
+    const timer = window.setInterval(verifyVersion, 30000);
     return () => {
       mounted = false;
       unsubCloudVer();
@@ -96,6 +110,12 @@ export const AppUpdateBannerModal: React.FC<AppUpdateBannerModalProps> = ({
       }
       setHasPendingUpdate(false);
       setJustUpdatedSuccess(true);
+      if (latestRelease.version !== CURRENT_APP_VERSION) {
+        window.setTimeout(() => {
+          window.location.reload();
+        }, 500);
+        return;
+      }
       window.setTimeout(() => {
         setJustUpdatedSuccess(false);
         handleCloseModal();
