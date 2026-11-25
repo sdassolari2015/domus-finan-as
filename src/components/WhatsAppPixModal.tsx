@@ -64,6 +64,10 @@ interface WhatsAppServerStatus {
   hasVerifyToken: boolean;
   hasAllowedPhones: boolean;
   hasGeminiKey: boolean;
+  metaTokenValid?: boolean | null;
+  metaPhoneDisplay?: string | null;
+  metaVerifiedName?: string | null;
+  metaError?: string | null;
   pendingInboxCount: number;
   webhookPath: string;
 }
@@ -121,6 +125,12 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
   const [feed, setFeed] = useState<FeedEntry[]>([]);
   const [waStatus, setWaStatus] = useState<WhatsAppServerStatus | null>(null);
   const [copiedWebhook, setCopiedWebhook] = useState(false);
+  const [testPhoneInput, setTestPhoneInput] = useState('5543996040935');
+  const [isSendingTest, setIsSendingTest] = useState(false);
+  const [testResultMsg, setTestResultMsg] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -338,6 +348,50 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
       window.setTimeout(() => setCopiedWebhook(false), 3000);
     } catch {
       onShowToast(`URL do Webhook: ${webhookUrl}`);
+    }
+  };
+
+  const handleSendTestWhatsApp = async () => {
+    const cleanPhone = testPhoneInput.replace(/\D/g, '');
+    if (!cleanPhone || cleanPhone.length < 10) {
+      setTestResultMsg({
+        ok: false,
+        text: 'Informe seu número com DDI 55 e DDD (ex: 5543996040935).',
+      });
+      return;
+    }
+    setIsSendingTest(true);
+    setTestResultMsg(null);
+    try {
+      const res = await fetch('/api/whatsapp/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: cleanPhone }),
+      });
+      const data = await res.json();
+      if (data?.ok) {
+        setTestResultMsg({
+          ok: true,
+          text: 'Mensagem de teste enviada com sucesso pela API da Meta! Verifique seu WhatsApp.',
+        });
+        onShowToast('Mensagem de teste enviada para seu WhatsApp!');
+      } else {
+        const firstErr =
+          Array.isArray(data?.attempts) && data.attempts[0]?.response?.error?.message
+            ? data.attempts[0].response.error.message
+            : data?.error || 'A Meta recusou o envio.';
+        setTestResultMsg({
+          ok: false,
+          text: `Retorno da Meta: ${firstErr}`,
+        });
+      }
+    } catch (err) {
+      setTestResultMsg({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Erro ao testar envio.',
+      });
+    } finally {
+      setIsSendingTest(false);
     }
   };
 
@@ -763,6 +817,61 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                 <p className="leading-relaxed text-slate-600">
                   A Meta (dona do WhatsApp) exige que o número seja ativado na conta oficial do <strong>Meta for Developers</strong> (gratuito para uso pessoal/teste). O servidor do Domus já está 100% programado para receber seus comprovantes PIX e responder confirmando o lançamento direto no seu WhatsApp.
                 </p>
+                {waStatus?.metaPhoneDisplay && (
+                  <p className="text-xs font-bold text-emerald-800">
+                    Número do Robô Ativo na Meta: {waStatus.metaPhoneDisplay} ({waStatus.metaVerifiedName || 'Test Number'})
+                  </p>
+                )}
+                {waStatus?.metaError && (
+                  <p className="text-xs font-bold text-red-700 bg-red-50 border border-red-200 rounded p-2">
+                    Aviso da Meta: {waStatus.metaError}
+                  </p>
+                )}
+              </div>
+
+              {/* Test Send Direct to WhatsApp */}
+              <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-2.5">
+                <label className="block text-xs font-bold text-slate-900">
+                  Testar Envio de Mensagem para seu WhatsApp Agora
+                </label>
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                  <input
+                    type="text"
+                    value={testPhoneInput}
+                    onChange={(e) => setTestPhoneInput(e.target.value)}
+                    placeholder="5543996040935"
+                    className="flex-1 px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg"
+                  />
+                  <button
+                    type="button"
+                    disabled={isSendingTest}
+                    onClick={() => void handleSendTestWhatsApp()}
+                    className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-300 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 shrink-0"
+                  >
+                    {isSendingTest ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Enviando...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-3.5 h-3.5" />
+                        <span>Testar no Meu WhatsApp</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                {testResultMsg && (
+                  <div
+                    className={`p-2.5 rounded-lg border text-xs ${
+                      testResultMsg.ok
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                        : 'bg-red-50 border-red-200 text-red-800'
+                    }`}
+                  >
+                    {testResultMsg.text}
+                  </div>
+                )}
               </div>
 
               {/* Webhook URL to paste in Meta */}

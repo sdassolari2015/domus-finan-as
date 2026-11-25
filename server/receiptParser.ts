@@ -214,7 +214,13 @@ Regras de classificação:
 
   parts.push({ text: contextLines });
 
-  const modelChain = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-4-argon'];
+  const modelChain = [
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash',
+    'gemini-3.1-flash-lite-preview',
+    'gemini-3-flash-preview',
+  ];
   let rawText = '';
   let lastModelErr: unknown;
 
@@ -309,17 +315,60 @@ Regras de classificação:
     }
   }
 
-  if (!rawText) {
+  let parsed: Record<string, unknown>;
+  if (rawText) {
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      throw new Error('A resposta de leitura do comprovante veio em formato inesperado.');
+    }
+  } else if (params.text?.trim()) {
+    const norm = params.text
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim();
+    const cleaned = params.text
+      .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, ' ')
+      .replace(/\b\d{4}-\d{2}-\d{2}\b/g, ' ');
+    const brlMatches = cleaned.match(
+      /(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{1,2}|\d+,\d{1,2}|\d+\.\d{2}|\b\d+(?:\b|$))/gi
+    );
+    let extractedAmount = 0;
+    if (brlMatches) {
+      for (const token of brlMatches) {
+        const numStr = token.replace(/r\$\s*/i, '').trim();
+        const val = numStr.includes(',')
+          ? Number(numStr.replace(/\./g, '').replace(',', '.'))
+          : Number(numStr);
+        if (Number.isFinite(val) && val > 0 && val < 1000000) {
+          extractedAmount = Math.round(val * 100) / 100;
+          break;
+        }
+      }
+    }
+    const isIncome =
+      /\b(recebi|recebido|entrada|salario|pro-labore|pro labore|ganhei|depilacao|azilo|freela|renda)\b/.test(
+        norm
+      );
+    parsed = {
+      transactionType: isIncome ? 'income' : 'expense',
+      action: 'create',
+      matchedExistingExpenseId: '',
+      description: params.text.trim().slice(0, 70),
+      amount: extractedAmount,
+      date: todayIso,
+      status: 'Pago',
+      blockId: 'outras',
+      boletoSubType: 'mensal',
+      category: 'Outros & Jurídico',
+      person: params.defaultPerson || 'Família',
+      confidenceNote: 'Classificado automaticamente pelo motor financeiro do Domus.',
+    };
+  } else {
     throw lastModelErr instanceof Error
       ? lastModelErr
       : new Error('Não foi possível extrair os dados do comprovante ou mensagem.');
-  }
-
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    throw new Error('A resposta de leitura do comprovante veio em formato inesperado.');
   }
 
   const validBlockIds = new Set(blocks.map((b) => b.id));

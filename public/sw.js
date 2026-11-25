@@ -1,4 +1,4 @@
-const CACHE_NAME = 'domus-standalone-cache-v2.9.0';
+const CACHE_NAME = 'domus-standalone-cache-v2.9.2';
 
 const PRECACHE_URLS = [
   '/standalone/index.html',
@@ -168,9 +168,8 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // 2. Static production bundle & icon assets: Cache-First for instant offline startup
+  // 2. Static icon assets: Cache-First for instant startup
   if (
-    url.pathname.startsWith('/standalone/') ||
     url.pathname.endsWith('.png') ||
     url.pathname.endsWith('.ico') ||
     url.pathname.endsWith('.svg') ||
