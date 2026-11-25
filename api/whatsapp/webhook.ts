@@ -1,5 +1,10 @@
 import crypto from 'crypto';
 import { GoogleGenAI, Type } from '@google/genai';
+import { initializeApp, getApps } from 'firebase/app';
+import { getFirestore, doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
+import firebaseConfig from '../../firebase-applet-config.json';
+
+const HOUSEHOLD_DOC_ID = 'domus_family';
 
 const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/jpeg',
@@ -34,6 +39,17 @@ const DEFAULT_BLOCKS = [
   { id: 'outras', shortName: 'Boletos e Fixas', fullTitle: 'Outras Despesas - Boletos e Fixas', group: 'boletos_pix' },
 ];
 
+const MODEL_FALLBACK_CHAIN = [
+  'gemini-3.1-flash-lite',
+  'gemini-4-hydrogen',
+  'gemini-4-argon',
+];
+
+function getServerFirestore() {
+  const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
+  return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+}
+
 function safeCompareStrings(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'utf8');
   const bufB = Buffer.from(b, 'utf8');
@@ -56,28 +72,49 @@ function isAllowedMetaMediaUrl(rawUrl: string): boolean {
   }
 }
 
+// Normalizes Brazilian 9-digit mobile numbers so replies work whether Meta delivered 12 or 13 digits
+function getCandidateRecipientPhones(rawPhone: string): string[] {
+  const digits = rawPhone.replace(/\D/g, '');
+  const list = [digits];
+  if (digits.startsWith('55') && digits.length === 12) {
+    // Insert 9 after DDD: 55 + DD + 9 + 8digits
+    list.push(`${digits.slice(0, 4)}9${digits.slice(4)}`);
+  } else if (digits.startsWith('55') && digits.length === 13 && digits[4] === '9') {
+    // Also try 12-digit version without the 9
+    list.push(`${digits.slice(0, 4)}${digits.slice(5)}`);
+  }
+  return Array.from(new Set(list));
+}
+
 async function sendWhatsAppTextReply(toPhone: string, bodyText: string): Promise<void> {
   const token = process.env.WHATSAPP_ACCESS_TOKEN;
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   if (!token || !phoneNumberId) return;
-  if (!/^[0-9]{6,20}$/.test(phoneNumberId) || !/^[0-9]{8,20}$/.test(toPhone)) return;
+  if (!/^[0-9]{6,20}$/.test(phoneNumberId)) return;
 
-  try {
-    await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: toPhone,
-        type: 'text',
-        text: { body: bodyText.slice(0, 1000) },
-      }),
-    });
-  } catch {
-    // Non-blocking reply
+  const candidates = getCandidateRecipientPhones(toPhone);
+  for (const candidate of candidates) {
+    if (!/^[0-9]{8,20}$/.test(candidate)) continue;
+    try {
+      const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          to: candidate,
+          type: 'text',
+          text: { body: bodyText.slice(0, 1000) },
+        }),
+      });
+      if (res.ok) {
+        return;
+      }
+    } catch {
+      // Try next candidate
+    }
   }
 }
 
@@ -125,22 +162,117 @@ function formatBRLServer(val: number): string {
   });
 }
 
-async function parseMessageInWebhook(params: {
+async function generateWithFallback(
+  ai: GoogleGenAI,
+  parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
+  systemInstruction: string
+): Promise<string> {
+  let lastErr: unknown;
+  for (const modelName of MODEL_FALLBACK_CHAIN) {
+    try {
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: { parts },
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              transactionType: { type: Type.STRING },
+              action: { type: Type.STRING },
+              matchedExistingExpenseId: { type: Type.STRING },
+              description: { type: Type.STRING },
+              amount: { type: Type.NUMBER },
+              date: { type: Type.STRING },
+              status: { type: Type.STRING },
+              blockId: { type: Type.STRING },
+              boletoSubType: { type: Type.STRING },
+              category: { type: Type.STRING },
+              person: { type: Type.STRING },
+            },
+            required: [
+              'transactionType',
+              'action',
+              'description',
+              'amount',
+              'date',
+              'status',
+              'blockId',
+              'boletoSubType',
+              'category',
+              'person',
+            ],
+          },
+        },
+      });
+      const text = (response.text ?? '').trim();
+      if (text) return text;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Gemini unavailable');
+}
+
+async function parseAndSaveDirectToFirestore(params: {
   text?: string;
   imageBase64?: string;
   imageMimeType?: string;
-  defaultPerson?: string;
+  senderName: string;
 }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY not configured');
   }
+
+  const db = getServerFirestore();
+  let activeMonthKey = '2026-10';
+  let blocks = [...DEFAULT_BLOCKS];
+  let existingExpenses: Array<{
+    id: string;
+    description: string;
+    amount: number;
+    dueDate: string;
+    status: string;
+    blockId: string;
+    category: string;
+  }> = [];
+
+  try {
+    const workspaceSnap = await getDoc(doc(db, 'households', HOUSEHOLD_DOC_ID));
+    if (workspaceSnap.exists()) {
+      const wData = workspaceSnap.data();
+      if (typeof wData.activeMonthKey === 'string' && /^\d{4}-\d{2}$/.test(wData.activeMonthKey)) {
+        activeMonthKey = wData.activeMonthKey;
+      }
+    }
+    const ledgerSnap = await getDoc(
+      doc(db, 'households', HOUSEHOLD_DOC_ID, 'ledgers', activeMonthKey)
+    );
+    if (ledgerSnap.exists()) {
+      const lData = ledgerSnap.data();
+      if (Array.isArray(lData.customBlocks) && lData.customBlocks.length > 0) {
+        blocks = lData.customBlocks;
+      }
+      if (Array.isArray(lData.expenses)) {
+        existingExpenses = lData.expenses;
+      }
+    }
+  } catch {
+    // Fallback to defaults if Firestore read fails
+  }
+
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
   });
 
   const todayIso = new Date().toISOString().slice(0, 10);
+  const defaultPerson = params.senderName.toLowerCase().includes('viviane')
+    ? 'Viviane'
+    : 'Rodolfo';
+
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
   if (params.imageBase64 && params.imageMimeType) {
     parts.push({
@@ -151,52 +283,154 @@ async function parseMessageInWebhook(params: {
     });
   }
   parts.push({
-    text: `Data de hoje: ${todayIso}. Remetente: ${params.defaultPerson || 'Família'}. Blocos: ${JSON.stringify(DEFAULT_BLOCKS)}. Mensagem: ${params.text || 'Comprovante PIX'}`,
+    text: [
+      `Data de hoje: ${todayIso}`,
+      `Mês ativo: ${activeMonthKey}`,
+      `Remetente: ${defaultPerson}`,
+      `Blocos disponíveis: ${JSON.stringify(blocks)}`,
+      `Contas PENDENTES existentes no mês: ${JSON.stringify(
+        existingExpenses.filter((e) => e.status === 'Pendente')
+      )}`,
+      params.text ? `Mensagem: "${params.text}"` : 'Extraia os dados do comprovante PIX.',
+    ].join('\n'),
   });
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: { parts },
-    config: {
-      systemInstruction: `Classifique o comprovante PIX ou mensagem financeira da família (Rodolfo e Viviane) em JSON. Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          transactionType: { type: Type.STRING },
-          description: { type: Type.STRING },
-          amount: { type: Type.NUMBER },
-          date: { type: Type.STRING },
-          status: { type: Type.STRING },
-          blockId: { type: Type.STRING },
-          boletoSubType: { type: Type.STRING },
-          category: { type: Type.STRING },
-          person: { type: Type.STRING },
+  const systemInstruction = `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise o comprovante PIX ou mensagem e classifique no local exato.
+- transactionType: "income" (entrada/recebido) ou "expense" (saída/pago).
+- action: "mark_existing_paid" se corresponder a uma conta pendente existente (informe o id em matchedExistingExpenseId), ou "create" se for novo.
+- blockId: id do cartão/conta se mencionado (ex: nubank, bradesco, santander, caixa, sicredi, quero_quero), ou "outras" para PIX/boletos/gastos gerais.
+- boletoSubType: "fixa" (luz, água, internet, fixas mensais), "variavel" (parcelado, consórcio, boleto parcelado) ou "mensal" (mercado, farmácia, gasolina, gastos do mês).
+- Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`;
+
+  const jsonText = await generateWithFallback(ai, parts, systemInstruction);
+  const raw = JSON.parse(jsonText);
+
+  const transactionType = raw.transactionType === 'income' ? 'income' : 'expense';
+  const matchedExpense =
+    transactionType === 'expense' && raw.matchedExistingExpenseId
+      ? existingExpenses.find(
+          (e) => e.id === raw.matchedExistingExpenseId && e.status === 'Pendente'
+        ) || null
+      : null;
+  const action =
+    matchedExpense && raw.action === 'mark_existing_paid'
+      ? 'mark_existing_paid'
+      : 'create';
+  const validBlockIds = new Set(blocks.map((b) => b.id));
+  const blockId = matchedExpense
+    ? matchedExpense.blockId
+    : validBlockIds.has(raw.blockId)
+    ? raw.blockId
+    : 'outras';
+  const boletoSubType =
+    raw.boletoSubType === 'fixa' || raw.boletoSubType === 'variavel'
+      ? raw.boletoSubType
+      : 'mensal';
+  const category = (ALLOWED_CATEGORIES as readonly string[]).includes(raw.category)
+    ? raw.category
+    : 'Outros & Jurídico';
+  const person =
+    raw.person === 'Rodolfo' || raw.person === 'Viviane' ? raw.person : defaultPerson;
+  const amountNum = Number(raw.amount);
+  const amount =
+    Number.isFinite(amountNum) && amountNum > 0 ? Math.round(amountNum * 100) / 100 : 0;
+  const description = String(raw.description || 'Lançamento via WhatsApp').slice(0, 75);
+  const date =
+    typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date)
+      ? raw.date
+      : `${activeMonthKey}-${todayIso.slice(8, 10)}`;
+  const status = raw.status === 'Pendente' ? 'Pendente' : 'Pago';
+
+  const blockObj = blocks.find((b) => b.id === blockId);
+  const destinationLabel =
+    transactionType === 'income'
+      ? `Visão Geral → Entradas da Família (${person})`
+      : action === 'mark_existing_paid' && matchedExpense
+      ? `Baixa automática: "${matchedExpense.description}" (Pago)`
+      : blockId !== 'outras' && blockObj
+      ? `Cartões e Contas → ${blockObj.shortName}`
+      : boletoSubType === 'fixa'
+      ? 'Boletos e Fixas → Despesas Fixas'
+      : boletoSubType === 'variavel'
+      ? 'Boletos e Fixas → Despesas Variáveis'
+      : 'Boletos e Fixas → Gastos Mensais';
+
+  // Persist directly to Google Cloud Firestore so the spreadsheet updates immediately in real time!
+  let savedToCloud = false;
+  try {
+    const ledgerRef = doc(db, 'households', HOUSEHOLD_DOC_ID, 'ledgers', activeMonthKey);
+    const ledgerSnap = await getDoc(ledgerRef);
+    if (ledgerSnap.exists() && amount > 0) {
+      const lData = ledgerSnap.data();
+      const incomes = Array.isArray(lData.incomes) ? [...lData.incomes] : [];
+      let expenses = Array.isArray(lData.expenses) ? [...lData.expenses] : [];
+
+      if (transactionType === 'income') {
+        incomes.push({
+          id: `inc-wa-${Date.now()}`,
+          person,
+          description,
+          amount,
+          date,
+        });
+      } else if (action === 'mark_existing_paid' && matchedExpense) {
+        expenses = expenses.map((e) =>
+          e.id === matchedExpense.id ? { ...e, status: 'Pago' } : e
+        );
+      } else {
+        expenses.push({
+          id: `exp-wa-${Date.now()}`,
+          description,
+          dueDate: date,
+          currentInstallment: null,
+          totalInstallments: null,
+          amount,
+          status,
+          blockId,
+          category,
+          isRecurringFixed: boletoSubType === 'fixa',
+          boletoSubType,
+          notes: `Lançado via WhatsApp (${params.senderName})`,
+        });
+      }
+
+      const updatedPayload: Record<string, unknown> = {
+        monthKey: lData.monthKey || activeMonthKey,
+        label: lData.label || activeMonthKey,
+        year: Number(lData.year) || 2026,
+        month: Number(lData.month) || 10,
+        incomes: incomes.slice(0, 100),
+        expenses: expenses.slice(0, 500),
+        updatedAt: serverTimestamp(),
+      };
+      if (Array.isArray(lData.customBlocks) && lData.customBlocks.length > 0) {
+        updatedPayload.customBlocks = lData.customBlocks;
+      }
+
+      await setDoc(ledgerRef, updatedPayload);
+      await setDoc(
+        doc(db, 'households', HOUSEHOLD_DOC_ID),
+        {
+          householdId: HOUSEHOLD_DOC_ID,
+          activeMonthKey,
+          lastAction: `WhatsApp (${params.senderName}): ${description} (${formatBRLServer(amount)})`,
+          updatedAt: serverTimestamp(),
         },
-        required: ['transactionType', 'description', 'amount', 'status', 'blockId', 'boletoSubType'],
-      },
-    },
-  });
-
-  const parsed = JSON.parse((response.text ?? '{}').trim());
-  const isIncome = parsed.transactionType === 'income';
-  const blockObj = DEFAULT_BLOCKS.find((b) => b.id === parsed.blockId);
-  const destinationLabel = isIncome
-    ? `Visão Geral → Entradas (${parsed.person || 'Família'})`
-    : parsed.blockId && parsed.blockId !== 'outras' && blockObj
-    ? `Cartões e Contas → ${blockObj.shortName}`
-    : parsed.boletoSubType === 'fixa'
-    ? 'Boletos e Fixas → Despesas Fixas'
-    : parsed.boletoSubType === 'variavel'
-    ? 'Boletos e Fixas → Despesas Variáveis'
-    : 'Boletos e Fixas → Gastos Mensais';
+        { merge: true }
+      );
+      savedToCloud = true;
+    }
+  } catch {
+    savedToCloud = false;
+  }
 
   return {
-    transactionType: isIncome ? 'income' : 'expense',
-    description: String(parsed.description || 'Lançamento PIX').slice(0, 75),
-    amount: Number(parsed.amount) || 0,
-    status: parsed.status === 'Pendente' ? 'Pendente' : 'Pago',
+    transactionType,
+    description,
+    amount,
+    status,
     destinationLabel,
+    savedToCloud,
   };
 }
 
@@ -247,7 +481,7 @@ export default async function handler(
             if (!fromPhone) continue;
 
             const contact = contacts.find((c: { wa_id?: string }) => c?.wa_id === msg?.from);
-            const senderName = String(contact?.profile?.name || 'WhatsApp').slice(0, 40);
+            const senderName = String(contact?.profile?.name || 'Rodolfo').slice(0, 40);
             const msgType = String(msg?.type || '');
 
             let textContent = '';
@@ -272,43 +506,50 @@ export default async function handler(
                 mediaBase64 = media.base64;
                 mediaMimeType = media.mimeType;
               }
+            } else {
+              await sendWhatsAppTextReply(
+                fromPhone,
+                'Domus Finanças: Envie a foto/PDF de um comprovante PIX ou uma mensagem com o valor (ex: "Paguei 150 mercado" ou "Recebi 800 extra").'
+              );
+              continue;
             }
 
             if (!textContent && !mediaBase64) continue;
 
             try {
-              const parsed = await parseMessageInWebhook({
+              const parsed = await parseAndSaveDirectToFirestore({
                 text: textContent || undefined,
                 imageBase64: mediaBase64,
                 imageMimeType: mediaMimeType,
-                defaultPerson: senderName.toLowerCase().includes('viviane')
-                  ? 'Viviane'
-                  : senderName.toLowerCase().includes('rodolfo')
-                  ? 'Rodolfo'
-                  : 'Família',
+                senderName,
               });
 
               const replySummary = [
-                '✅ *Lançamento identificado no Domus Finanças!*',
+                '✅ *Lançado na Planilha Domus Finanças!*',
                 `• *Tipo:* ${parsed.transactionType === 'income' ? 'Entrada / Receita' : 'Saída / Pagamento'}`,
                 `• *Descrição:* ${parsed.description}`,
                 `• *Valor:* ${formatBRLServer(parsed.amount)}`,
                 `• *Local:* ${parsed.destinationLabel}`,
                 `• *Situação:* ${parsed.status}`,
-              ].join('\n');
+                parsed.savedToCloud
+                  ? '☁️ *Já gravado automaticamente na nuvem da família!*'
+                  : '',
+              ]
+                .filter(Boolean)
+                .join('\n');
 
               await sendWhatsAppTextReply(fromPhone, replySummary);
             } catch {
               await sendWhatsAppTextReply(
                 fromPhone,
-                '⚠️ Não consegui ler este comprovante/mensagem agora. Tente enviar novamente.'
+                '⚠️ Recebi sua mensagem, mas não consegui identificar o valor. Envie por exemplo: "Paguei 150,00 mercado" ou a foto nítida do comprovante PIX.'
               );
             }
           }
         }
       }
     } catch {
-      // Ignore errors so Meta receives 200 OK
+      // Always return 200 OK to Meta
     }
     return res.status(200).json({ status: 'received' });
   }

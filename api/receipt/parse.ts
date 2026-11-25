@@ -129,48 +129,64 @@ export default async function handler(
       ].join('\n'),
     });
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: { parts },
-      config: {
-        systemInstruction: `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise o comprovante PIX ou mensagem e classifique no local exato. Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            transactionType: { type: Type.STRING },
-            action: { type: Type.STRING },
-            matchedExistingExpenseId: { type: Type.STRING },
-            description: { type: Type.STRING },
-            amount: { type: Type.NUMBER },
-            date: { type: Type.STRING },
-            status: { type: Type.STRING },
-            blockId: { type: Type.STRING },
-            boletoSubType: { type: Type.STRING },
-            category: { type: Type.STRING },
-            currentInstallment: { type: Type.INTEGER },
-            totalInstallments: { type: Type.INTEGER },
-            person: { type: Type.STRING },
-            confidenceNote: { type: Type.STRING },
-          },
-          required: [
-            'transactionType',
-            'action',
-            'description',
-            'amount',
-            'date',
-            'status',
-            'blockId',
-            'boletoSubType',
-            'category',
-            'person',
-            'confidenceNote',
-          ],
-        },
-      },
-    });
+    const modelChain = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-4-argon'];
+    let responseText = '';
+    let lastModelErr: unknown;
 
-    const raw = JSON.parse((response.text ?? '{}').trim());
+    for (const modelName of modelChain) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: { parts },
+          config: {
+            systemInstruction: `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise o comprovante PIX ou mensagem e classifique no local exato. Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                transactionType: { type: Type.STRING },
+                action: { type: Type.STRING },
+                matchedExistingExpenseId: { type: Type.STRING },
+                description: { type: Type.STRING },
+                amount: { type: Type.NUMBER },
+                date: { type: Type.STRING },
+                status: { type: Type.STRING },
+                blockId: { type: Type.STRING },
+                boletoSubType: { type: Type.STRING },
+                category: { type: Type.STRING },
+                currentInstallment: { type: Type.INTEGER },
+                totalInstallments: { type: Type.INTEGER },
+                person: { type: Type.STRING },
+                confidenceNote: { type: Type.STRING },
+              },
+              required: [
+                'transactionType',
+                'action',
+                'description',
+                'amount',
+                'date',
+                'status',
+                'blockId',
+                'boletoSubType',
+                'category',
+                'person',
+                'confidenceNote',
+              ],
+            },
+          },
+        });
+        responseText = (response.text ?? '').trim();
+        if (responseText) break;
+      } catch (err) {
+        lastModelErr = err;
+      }
+    }
+
+    if (!responseText) {
+      throw lastModelErr || new Error('Serviço de leitura temporariamente ocupado. Tente novamente.');
+    }
+
+    const raw = JSON.parse(responseText);
     const transactionType = raw.transactionType === 'income' ? 'income' : 'expense';
     const matchedExpense =
       transactionType === 'expense' && raw.matchedExistingExpenseId

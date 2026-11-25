@@ -214,92 +214,105 @@ Regras de classificação:
 
   parts.push({ text: contextLines });
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: { parts },
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          transactionType: {
-            type: Type.STRING,
-            description: 'Must be "expense" or "income"',
-          },
-          action: {
-            type: Type.STRING,
-            description: 'Must be "create" or "mark_existing_paid"',
-          },
-          matchedExistingExpenseId: {
-            type: Type.STRING,
-            description: 'Exact ID from existing pending expenses if action is mark_existing_paid, otherwise empty string',
-          },
-          description: {
-            type: Type.STRING,
-            description: 'Short clear Portuguese description of the transaction (max 70 chars)',
-          },
-          amount: {
-            type: Type.NUMBER,
-            description: 'Positive numeric value in BRL',
-          },
-          date: {
-            type: Type.STRING,
-            description: 'Transaction or due date in YYYY-MM-DD format',
-          },
-          status: {
-            type: Type.STRING,
-            description: 'Must be "Pago" or "Pendente"',
-          },
-          blockId: {
-            type: Type.STRING,
-            description: 'Exact id from the available blocks list, or "outras"',
-          },
-          boletoSubType: {
-            type: Type.STRING,
-            description: 'Must be "fixa", "mensal", or "variavel"',
-          },
-          category: {
-            type: Type.STRING,
-            description: 'Exact category from the allowed list',
-          },
-          currentInstallment: {
-            type: Type.INTEGER,
-            description: 'Current installment number if installment purchase, otherwise 0',
-          },
-          totalInstallments: {
-            type: Type.INTEGER,
-            description: 'Total installments if installment purchase, otherwise 0',
-          },
-          person: {
-            type: Type.STRING,
-            description: 'Must be "Rodolfo", "Viviane", or "Família"',
-          },
-          confidenceNote: {
-            type: Type.STRING,
-            description: 'One short sentence in Portuguese explaining how the receipt/message was read and classified',
+  const modelChain = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-4-argon'];
+  let rawText = '';
+  let lastModelErr: unknown;
+
+  for (const modelName of modelChain) {
+    try {
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: { parts },
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              transactionType: {
+                type: Type.STRING,
+                description: 'Must be "expense" or "income"',
+              },
+              action: {
+                type: Type.STRING,
+                description: 'Must be "create" or "mark_existing_paid"',
+              },
+              matchedExistingExpenseId: {
+                type: Type.STRING,
+                description: 'Exact ID from existing pending expenses if action is mark_existing_paid, otherwise empty string',
+              },
+              description: {
+                type: Type.STRING,
+                description: 'Short clear Portuguese description of the transaction (max 70 chars)',
+              },
+              amount: {
+                type: Type.NUMBER,
+                description: 'Positive numeric value in BRL',
+              },
+              date: {
+                type: Type.STRING,
+                description: 'Transaction or due date in YYYY-MM-DD format',
+              },
+              status: {
+                type: Type.STRING,
+                description: 'Must be "Pago" or "Pendente"',
+              },
+              blockId: {
+                type: Type.STRING,
+                description: 'Exact id from the available blocks list, or "outras"',
+              },
+              boletoSubType: {
+                type: Type.STRING,
+                description: 'Must be "fixa", "mensal", or "variavel"',
+              },
+              category: {
+                type: Type.STRING,
+                description: 'Exact category from the allowed list',
+              },
+              currentInstallment: {
+                type: Type.INTEGER,
+                description: 'Current installment number if installment purchase, otherwise 0',
+              },
+              totalInstallments: {
+                type: Type.INTEGER,
+                description: 'Total installments if installment purchase, otherwise 0',
+              },
+              person: {
+                type: Type.STRING,
+                description: 'Must be "Rodolfo", "Viviane", or "Família"',
+              },
+              confidenceNote: {
+                type: Type.STRING,
+                description: 'One short sentence in Portuguese explaining how the receipt/message was read and classified',
+              },
+            },
+            required: [
+              'transactionType',
+              'action',
+              'description',
+              'amount',
+              'date',
+              'status',
+              'blockId',
+              'boletoSubType',
+              'category',
+              'person',
+              'confidenceNote',
+            ],
           },
         },
-        required: [
-          'transactionType',
-          'action',
-          'description',
-          'amount',
-          'date',
-          'status',
-          'blockId',
-          'boletoSubType',
-          'category',
-          'person',
-          'confidenceNote',
-        ],
-      },
-    },
-  });
+      });
+      rawText = (response.text ?? '').trim();
+      if (rawText) break;
+    } catch (err) {
+      lastModelErr = err;
+    }
+  }
 
-  const rawText = (response.text ?? '').trim();
   if (!rawText) {
-    throw new Error('Não foi possível extrair os dados do comprovante ou mensagem.');
+    throw lastModelErr instanceof Error
+      ? lastModelErr
+      : new Error('Não foi possível extrair os dados do comprovante ou mensagem.');
   }
 
   let parsed: Record<string, unknown>;
