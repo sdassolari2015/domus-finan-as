@@ -347,6 +347,8 @@ async function parseAndSaveToSpreadsheet(params) {
         apiVersion: 'v1beta',
         httpOptions: {
           apiVersion: 'v1beta',
+          timeout: 9000,
+          retryOptions: { attempts: 1 },
           headers: { 'User-Agent': 'aistudio-build' },
         },
       });
@@ -377,11 +379,14 @@ async function parseAndSaveToSpreadsheet(params) {
 
       for (const modelName of MODEL_FALLBACK_CHAIN) {
         try {
+          const isGemini25 = modelName.startsWith('gemini-2.5');
           const response = await ai.models.generateContent({
             model: modelName,
             contents: { parts },
             config: {
               systemInstruction,
+              temperature: 0.1,
+              ...(isGemini25 ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
               responseMimeType: 'application/json',
               responseSchema: {
                 type: Type.OBJECT,

@@ -5,19 +5,19 @@ export interface AppReleaseNote {
   changes: string[];
 }
 
-export const CURRENT_APP_VERSION = '2.9.6';
+export const CURRENT_APP_VERSION = '2.9.7';
 export const PERMANENT_APP_LINK = 'https://domus-finan-as.vercel.app';
-export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.6';
+export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.7';
 
 export const APP_RELEASES: AppReleaseNote[] = [
   {
-    version: '2.9.6',
+    version: '2.9.7',
     releaseDate: 'Versão Atual',
-    title: 'Leitura de Comprovantes PNG no WhatsApp, Foto de Perfil & Retorno Automático',
+    title: 'Leitura Ultra-Rápida de Comprovantes PNG/PDF & Baixa Automática por Sinônimos ("Luz", "Água", "Internet")',
     changes: [
-      'Leitura de Comprovantes PNG/JPG/PDF no WhatsApp: Corrigido o motor Gemini v1beta com detecção binária de PNG para reconhecer e lançar comprovantes em imagem enviados no WhatsApp.',
-      'Interação Automática do Contato no WhatsApp: Ao enviar mensagem ou comprovante, o contato marca como lido (✓✓), reage na mensagem com ✅ (lançado) ou ❌ (erro) e envia a confirmação detalhada.',
-      'Logo do Domus Finanças no Contato: Sincronização automática da logo oficial do app no perfil WhatsApp Business + opção de QR Code direto.',
+      'Leitura Ultra-Rápida de Imagens e PDFs (~1,5s): Desativado o atraso de pensamento dinâmico (thinkingBudget: 0) e retentativas longas na Vercel para reconhecer comprovantes PNG, JPG e PDFs bancários (Sicredi, Santander, Bradesco, Nubank) na mesma hora.',
+      'Reconhecimento de Prints Cortados e Sinônimos: Se o print estiver sem o topo do valor mas você escrever o nome da conta na legenda (ex: "Luz" / "Copeldis" -> Fit Energia R$ 309,74; "Água" -> Samae; "Internet" -> Help Telecon), o sistema identifica a conta na planilha e dá baixa automática.',
+      'Extração Direta de Texto de PDFs Bancários + Logo e Reações (✅ / ❌) no Contato do WhatsApp.',
     ],
   },
   {

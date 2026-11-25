@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import zlib from 'zlib';
 import { GoogleGenAI, Type } from '@google/genai';
 import { initializeApp, getApps } from 'firebase/app';
 import {
@@ -9,12 +10,14 @@ import {
   serverTimestamp,
 } from 'firebase/firestore/lite';
 
+// Allow up to 60s execution on Vercel Serverless Functions
+export const maxDuration = 60;
+
 const FIREBASE_PROJECT_ID = 'nimble-might-65wls';
 const FIRESTORE_DATABASE_ID =
   'ai-studio-domuscontrolefin-af87b841-f232-48c0-a854-6751f0583616';
 const HOUSEHOLD_DOC_ID = 'domus_family';
 const DIAGNOSTIC_DOC_KEY = '2099-11';
-const APP_LOGO_PUBLIC_URL = 'https://domus-finan-as.vercel.app/domus-logo.png';
 
 const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/jpeg',
@@ -71,11 +74,11 @@ const DEFAULT_BLOCKS: BlockItem[] = [
   { id: 'outras', shortName: 'Boletos e Fixas', fullTitle: 'Outras Despesas - Boletos e Fixas', group: 'boletos_pix' },
 ];
 
+// Fast models first with thinking disabled (thinkingBudget: 0) and 1 attempt per model (no 30s backoff delay)
 const MODEL_FALLBACK_CHAIN = [
-  'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
   'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
   'gemini-3.1-flash-lite-preview',
   'gemini-3-flash-preview',
 ];
@@ -114,19 +117,15 @@ function isAllowedMetaMediaUrl(rawUrl: string): boolean {
 
 function detectMimeTypeFromMagicBytes(buf: Buffer, fallbackMime: string): string {
   if (buf.length >= 4) {
-    // PNG: 89 50 4E 47
     if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
       return 'image/png';
     }
-    // JPEG: FF D8 FF
     if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
       return 'image/jpeg';
     }
-    // PDF: 25 50 44 46 (%PDF)
     if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
       return 'application/pdf';
     }
-    // RIFF....WEBP
     if (
       buf.length >= 12 &&
       buf[0] === 0x52 &&
@@ -145,6 +144,51 @@ function detectMimeTypeFromMagicBytes(buf: Buffer, fallbackMime: string): string
   if (clean === 'image/jpg') return 'image/jpeg';
   if (ALLOWED_MEDIA_MIME_TYPES.has(clean)) return clean;
   return 'image/png';
+}
+
+// Extracts readable strings directly from PDF buffers (including FlateDecode compressed streams)
+function extractTextFromPdfBuffer(buf: Buffer): string {
+  try {
+    const rawLatin = buf.toString('latin1');
+    const chunks: string[] = [];
+    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = streamRegex.exec(rawLatin)) !== null) {
+      const streamBytes = Buffer.from(match[1], 'latin1');
+      let decoded = '';
+      try {
+        decoded = zlib.inflateSync(streamBytes).toString('latin1');
+      } catch {
+        try {
+          decoded = zlib.inflateRawSync(streamBytes).toString('latin1');
+        } catch {
+          decoded = match[1];
+        }
+      }
+
+      const parenMatches = decoded.match(/\((?:\\.|[^\\()])+\)/g);
+      if (parenMatches) {
+        for (const p of parenMatches) {
+          const inner = p
+            .slice(1, -1)
+            .replace(/\\([()\\])/g, '$1')
+            .replace(/\\n/g, ' ')
+            .replace(/\\r/g, ' ')
+            .replace(/[^\x20-\x7E\xA0-\xFF]/g, ' ')
+            .trim();
+          if (inner.length >= 2) {
+            chunks.push(inner);
+          }
+        }
+      }
+    }
+
+    const combined = chunks.join(' ').replace(/\s+/g, ' ').trim();
+    return combined.slice(0, 2500);
+  } catch {
+    return '';
+  }
 }
 
 function getCandidateRecipientPhones(rawPhone: string): string[] {
@@ -205,10 +249,10 @@ async function getActiveWhatsAppToken(): Promise<string> {
   return process.env.WHATSAPP_ACCESS_TOKEN?.trim() || '';
 }
 
+// IMPORTANT: firestore.rules requires data.label.size() <= 64!
 async function recordWebhookDiagnostic(
   summaryText: string,
-  statusText: string,
-  userMessageNotification?: string
+  statusText: string
 ): Promise<void> {
   try {
     const db = getServerFirestore();
@@ -231,15 +275,12 @@ async function recordWebhookDiagnostic(
       category: 'Outros & Jurídico',
       isRecurringFixed: false,
       notes: statusText.slice(0, 190),
-      ...(userMessageNotification ? { boletoSubType: 'mensal' } : {}),
     };
 
     await setDoc(diagRef, {
       householdId: HOUSEHOLD_DOC_ID,
       monthKey: DIAGNOSTIC_DOC_KEY,
-      label: userMessageNotification
-        ? userMessageNotification.slice(0, 500)
-        : 'Diagnóstico Webhook WhatsApp',
+      label: 'Diagnóstico Webhook WhatsApp', // Always <= 64 chars to satisfy firestore.rules
       year: 2099,
       month: 11,
       incomes: prevIncomes.slice(0, 10),
@@ -251,206 +292,107 @@ async function recordWebhookDiagnostic(
   }
 }
 
-// Marks the incoming WhatsApp message as read (2 blue checkmarks) and puts an emoji reaction (✅ / ❌ / ⏳)
 async function sendWhatsAppReadAndReaction(params: {
+  token: string;
   toPhone: string;
   messageId: string;
   emoji: string;
 }): Promise<void> {
-  const token = await getActiveWhatsAppToken();
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
-  if (!token || !phoneNumberId || !params.messageId) return;
+  if (!params.token || !phoneNumberId || !params.messageId) return;
 
-  // 1. Mark message as read (blue ticks)
-  await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      status: 'read',
-      message_id: params.messageId,
-    }),
-  }).catch(() => {});
-
-  // 2. React directly on the user's message with emoji (✅ or ❌ or ⏳)
   const candidates = getCandidateRecipientPhones(params.toPhone);
-  for (const candidate of candidates) {
-    if (!/^[0-9]{8,20}$/.test(candidate)) continue;
-    try {
-      const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          recipient_type: 'individual',
-          to: candidate,
-          type: 'reaction',
-          reaction: {
-            message_id: params.messageId,
-            emoji: params.emoji,
+  const primaryCandidate = candidates[0];
+
+  await Promise.all([
+    fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${params.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        status: 'read',
+        message_id: params.messageId,
+      }),
+    }).catch(() => {}),
+    primaryCandidate && /^[0-9]{8,20}$/.test(primaryCandidate)
+      ? fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${params.token}`,
+            'Content-Type': 'application/json',
           },
-        }),
-      });
-      if (res.ok) break;
-    } catch {
-      // Continue
-    }
-  }
+          body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: primaryCandidate,
+            type: 'reaction',
+            reaction: {
+              message_id: params.messageId,
+              emoji: params.emoji,
+            },
+          }),
+        }).catch(() => {})
+      : Promise.resolve(),
+  ]);
 }
 
 async function sendWhatsAppTextReply(
+  token: string,
   toPhone: string,
   bodyText: string,
   replyToMessageId?: string
 ): Promise<{ ok: boolean; details: string }> {
-  const token = await getActiveWhatsAppToken();
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
   if (!token || !phoneNumberId) {
-    return { ok: false, details: 'Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID' };
-  }
-  if (!/^[0-9]{6,20}$/.test(phoneNumberId)) {
-    return { ok: false, details: 'Invalid WHATSAPP_PHONE_NUMBER_ID format' };
+    return { ok: false, details: 'Missing WHATSAPP_ACCESS_TOKEN' };
   }
 
   const candidates = getCandidateRecipientPhones(toPhone);
-  const logs: string[] = [];
-
-  for (const candidate of candidates) {
-    if (!/^[0-9]{8,20}$/.test(candidate)) continue;
-    try {
-      const payload: Record<string, unknown> = {
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: candidate,
-        type: 'text',
-        text: { body: bodyText.slice(0, 1000) },
-      };
-      if (replyToMessageId) {
-        payload.context = { message_id: replyToMessageId };
-      }
-
-      const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
-      const respText = await res.text();
-      logs.push(`${candidate}:${res.status}:${respText.slice(0, 80)}`);
-      if (res.ok) {
-        return { ok: true, details: logs.join(' || ') };
-      }
-    } catch (err) {
-      logs.push(`${candidate}:ERR:${err instanceof Error ? err.message : 'fetch'}`);
-    }
+  const primaryCandidate = candidates[0];
+  if (!primaryCandidate || !/^[0-9]{8,20}$/.test(primaryCandidate)) {
+    return { ok: false, details: 'Invalid phone' };
   }
 
-  return { ok: false, details: logs.join(' || ') };
-}
-
-// Automatically uploads the Domus Finanças app logo and sets the WhatsApp Business Contact profile photo & description
-async function ensureWhatsAppContactLogoAndProfile(): Promise<void> {
   try {
-    const token = await getActiveWhatsAppToken();
-    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
-    if (!token || !phoneNumberId) return;
-
-    let profilePictureHandle = '';
-    try {
-      const logoRes = await fetch(APP_LOGO_PUBLIC_URL);
-      if (logoRes.ok) {
-        const logoBuf = Buffer.from(await logoRes.arrayBuffer());
-        let appId = 'app';
-        try {
-          const appRes = await fetch('https://graph.facebook.com/v21.0/app', {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          if (appRes.ok) {
-            const appJson = (await appRes.json()) as { id?: string };
-            if (appJson.id && /^[0-9]+$/.test(appJson.id)) {
-              appId = appJson.id;
-            }
-          }
-        } catch {
-          // Use 'app' alias
-        }
-
-        const sessionRes = await fetch(
-          `https://graph.facebook.com/v21.0/${appId}/uploads?file_length=${logoBuf.length}&file_type=image/png&file_name=domus-logo.png`,
-          {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${token}` },
-          }
-        );
-        if (sessionRes.ok) {
-          const sessionJson = (await sessionRes.json()) as { id?: string };
-          if (sessionJson.id) {
-            const uploadRes = await fetch(
-              `https://graph.facebook.com/v21.0/${sessionJson.id}`,
-              {
-                method: 'POST',
-                headers: {
-                  Authorization: `OAuth ${token}`,
-                  file_offset: '0',
-                  'Content-Type': 'image/png',
-                },
-                body: new Uint8Array(logoBuf),
-              }
-            );
-            if (uploadRes.ok) {
-              const uploadJson = (await uploadRes.json()) as { h?: string };
-              if (uploadJson.h) {
-                profilePictureHandle = uploadJson.h;
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      // Proceed with profile text metadata if image upload handle is not available
-    }
-
-    const profilePayload: Record<string, unknown> = {
+    const payload: Record<string, unknown> = {
       messaging_product: 'whatsapp',
-      about: 'Domus Finanças - Controle Financeiro Familiar',
-      address: 'Paraná, Brasil',
-      description:
-        'Assistente automático do Domus Finanças. Envie comprovantes PIX (PNG, JPG ou PDF) ou mensagens para lançar direto na planilha da família.',
-      vertical: 'PROF_SERVICES',
-      websites: ['https://domus-finan-as.vercel.app'],
+      recipient_type: 'individual',
+      to: primaryCandidate,
+      type: 'text',
+      text: { body: bodyText.slice(0, 1000) },
     };
-    if (profilePictureHandle) {
-      profilePayload.profile_picture_handle = profilePictureHandle;
+    if (replyToMessageId) {
+      payload.context = { message_id: replyToMessageId };
     }
 
-    await fetch(
-      `https://graph.facebook.com/v21.0/${phoneNumberId}/whatsapp_business_profile`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(profilePayload),
-      }
-    ).catch(() => {});
-  } catch {
-    // Ignore profile update errors
+    const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const respText = await res.text();
+    return {
+      ok: res.ok,
+      details: `${primaryCandidate}:${res.status}:${respText.slice(0, 75)}`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      details: `${primaryCandidate}:ERR:${err instanceof Error ? err.message : 'fetch'}`,
+    };
   }
 }
 
 async function downloadWhatsAppMediaAsBase64(
+  token: string,
   mediaId: string
-): Promise<{ base64: string; mimeType: string } | { error: string }> {
-  const token = await getActiveWhatsAppToken();
+): Promise<{ base64: string; mimeType: string; pdfExtractedText?: string } | { error: string }> {
   if (!token) return { error: 'Token ausente ao baixar mídia' };
   const cleanId = mediaId.trim();
   if (!/^[a-zA-Z0-9_.:-]{3,256}$/.test(cleanId)) {
@@ -494,9 +436,13 @@ async function downloadWhatsAppMediaAsBase64(
     metaJson.mime_type || 'image/png'
   );
 
+  const pdfExtractedText =
+    detectedMime === 'application/pdf' ? extractTextFromPdfBuffer(buffer) : undefined;
+
   return {
     base64: buffer.toString('base64'),
     mimeType: detectedMime,
+    pdfExtractedText,
   };
 }
 
@@ -555,6 +501,96 @@ function extractAmountFromText(rawText: string): number {
   return 0;
 }
 
+// Finds a matching expense in the active ledger by direct name, synonym ("Luz" / "Copel" -> "Fit Energia", "Água" -> "Samae", "Internet" -> "Help Telecon"), or amount
+function findMatchingExistingExpense(
+  searchText: string,
+  extractedAmount: number,
+  existingExpenses: ExistingExpenseItem[]
+): ExistingExpenseItem | null {
+  const norm = normalizeText(searchText);
+  if (!norm && extractedAmount <= 0) return null;
+
+  // Prefer pending expenses first, then any expense in the month
+  const ordered = [
+    ...existingExpenses.filter((e) => e.status === 'Pendente'),
+    ...existingExpenses.filter((e) => e.status !== 'Pendente'),
+  ];
+
+  // 1. Direct or word overlap match
+  for (const exp of ordered) {
+    const expNorm = normalizeText(exp.description);
+    const words = expNorm.split(/\s+/).filter((w) => w.length >= 3);
+    const nameMatches =
+      (expNorm.length >= 3 && norm.includes(expNorm)) ||
+      (words.length > 0 && words.every((w) => norm.includes(w)));
+    const amountMatches =
+      extractedAmount > 0 &&
+      exp.amount > 0 &&
+      Math.abs(exp.amount - extractedAmount) <= 1.5;
+
+    if (nameMatches || (amountMatches && words.some((w) => norm.includes(w)))) {
+      return exp;
+    }
+  }
+
+  // 2. Smart Brazilian household bill synonym matching (e.g. "Luz" / "Copeldis" -> "Fit Energia", "Água" -> "Samae", "Internet" -> "Help Telecon")
+  const synonymGroups: Array<{ trigger: RegExp; targetMatch: RegExp }> = [
+    {
+      trigger: /\b(luz|energia|copel|copeldis|eletricidade|celesc|energisa)\b/,
+      targetMatch: /\b(fit\s*energia|energia|luz|copel)\b/,
+    },
+    {
+      trigger: /\b(agua|samae|sanepar|sabesp)\b/,
+      targetMatch: /\b(samae|agua|sanepar)\b/,
+    },
+    {
+      trigger: /\b(internet|wifi|wi-fi|help|telecon|fibra)\b/,
+      targetMatch: /\b(help|telecon|internet)\b/,
+    },
+    {
+      trigger: /\b(casa|financiamento|fin\s*casa|prestacao\s*casa)\b/,
+      targetMatch: /\b(fin\.?\s*casa|financiamento|casa)\b/,
+    },
+    {
+      trigger: /\b(candeias|clube)\b/,
+      targetMatch: /\b(candeias)\b/,
+    },
+    {
+      trigger: /\b(lorenzo|reforco)\b/,
+      targetMatch: /\b(reforco|lorenzo)\b/,
+    },
+    {
+      trigger: /\b(funcional|crianca)\b/,
+      targetMatch: /\b(funcional)\b/,
+    },
+    {
+      trigger: /\b(virtus)\b/,
+      targetMatch: /\b(virtus)\b/,
+    },
+    {
+      trigger: /\b(start)\b/,
+      targetMatch: /\b(start)\b/,
+    },
+    {
+      trigger: /\b(aapomil)\b/,
+      targetMatch: /\b(aapomil)\b/,
+    },
+    {
+      trigger: /\b(tv|p2p|maluco|iptv)\b/,
+      targetMatch: /\b(tv|p2p|maluco)\b/,
+    },
+  ];
+
+  for (const grp of synonymGroups) {
+    if (grp.trigger.test(norm)) {
+      const found = ordered.find((e) => grp.targetMatch.test(normalizeText(e.description)));
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
 function parsePortugueseFinancialTextFallback(params: {
   text: string;
   blocks: BlockItem[];
@@ -582,30 +618,15 @@ function parsePortugueseFinancialTextFallback(params: {
     person = 'Rodolfo';
   }
 
-  let matchedExpense: ExistingExpenseItem | null = null;
-  if (transactionType === 'expense') {
-    const pendingList = params.existingExpenses.filter((e) => e.status === 'Pendente');
-    for (const exp of pendingList) {
-      const expNorm = normalizeText(exp.description);
-      const words = expNorm.split(/\s+/).filter((w) => w.length >= 3);
-      const nameMatches =
-        (expNorm.length >= 3 && norm.includes(expNorm)) ||
-        (words.length > 0 && words.every((w) => norm.includes(w)));
-      const amountMatches =
-        extractedAmount > 0 &&
-        exp.amount > 0 &&
-        Math.abs(exp.amount - extractedAmount) <= 1.5;
+  const matchedExpense =
+    transactionType === 'expense'
+      ? findMatchingExistingExpense(params.text, extractedAmount, params.existingExpenses)
+      : null;
 
-      if (nameMatches || (amountMatches && words.some((w) => norm.includes(w)))) {
-        matchedExpense = exp;
-        break;
-      }
-    }
-  }
-
-  const action: 'create' | 'mark_existing_paid' = matchedExpense
-    ? 'mark_existing_paid'
-    : 'create';
+  const action: 'create' | 'mark_existing_paid' =
+    matchedExpense && matchedExpense.status === 'Pendente'
+      ? 'mark_existing_paid'
+      : 'create';
 
   let blockId = matchedExpense ? matchedExpense.blockId : 'outras';
   if (!matchedExpense) {
@@ -626,7 +647,7 @@ function parsePortugueseFinancialTextFallback(params: {
   let boletoSubType: 'fixa' | 'mensal' | 'variavel' = 'mensal';
   let category: string = matchedExpense ? matchedExpense.category : 'Outros & Jurídico';
 
-  if (/\b(luz|energia|fit energia|agua|samae|sanepar|copel|celesc)\b/.test(norm)) {
+  if (/\b(luz|energia|fit energia|agua|samae|sanepar|copel|copeldis|celesc)\b/.test(norm)) {
     boletoSubType = 'fixa';
     category = 'Utilidades (Luz & Água)';
   } else if (/\b(internet|telecon|help|tim|vivo|claro|celular|telefone|wi-fi)\b/.test(norm)) {
@@ -714,14 +735,17 @@ async function generateWithFallback(
 ): Promise<string> {
   let lastErr: unknown;
 
-  // Pass 1: Structured JSON Schema on v1beta across all candidate models
   for (const modelName of MODEL_FALLBACK_CHAIN) {
     try {
+      const isGemini25 = modelName.startsWith('gemini-2.5');
       const response = await ai.models.generateContent({
         model: modelName,
         contents: { parts },
         config: {
           systemInstruction,
+          temperature: 0.1,
+          // CRITICAL: Disable dynamic thinking so Gemini Vision responds in ~1.5s instead of 28s!
+          ...(isGemini25 ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -761,27 +785,6 @@ async function generateWithFallback(
     }
   }
 
-  // Pass 2: Schema-free JSON extraction fallback in case any model rejected responseSchema
-  for (const modelName of MODEL_FALLBACK_CHAIN) {
-    try {
-      const fallbackParts = [
-        ...parts,
-        {
-          text: `${systemInstruction}\nResponda APENAS um objeto JSON válido com as chaves: {"transactionType":"expense","action":"create","matchedExistingExpenseId":"","description":"Nome do favorecido ou conta","amount":0.00,"date":"YYYY-MM-DD","status":"Pago","blockId":"outras","boletoSubType":"mensal","category":"Outros & Jurídico","person":"Rodolfo"}`,
-        },
-      ];
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: { parts: fallbackParts },
-      });
-      const text = (response.text ?? '').trim();
-      const jsonBlock = extractJsonObject(text);
-      if (jsonBlock) return jsonBlock;
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-
   throw lastErr || new Error('Gemini unavailable');
 }
 
@@ -789,6 +792,8 @@ async function parseAndSaveDirectToFirestore(params: {
   text?: string;
   imageBase64?: string;
   imageMimeType?: string;
+  pdfExtractedText?: string;
+  documentFilename?: string;
   senderName: string;
 }) {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -836,14 +841,24 @@ async function parseAndSaveDirectToFirestore(params: {
   let raw: Record<string, unknown> | null = null;
   let geminiErrMsg = '';
 
+  const combinedTextContext = [
+    params.text || '',
+    params.documentFilename ? `Arquivo: ${params.documentFilename}` : '',
+    params.pdfExtractedText ? `Texto do PDF: ${params.pdfExtractedText}` : '',
+  ]
+    .filter(Boolean)
+    .join(' | ');
+
   if (apiKey) {
     try {
-      // CRITICAL: Use apiVersion: 'v1beta' so multimodal PNG/JPG/PDF + systemInstruction + responseSchema work on @google/genai v3.6.1
+      // CRITICAL: retryOptions: { attempts: 1 } prevents 30s p-retry exponential backoff on rate-limited models!
       const ai = new GoogleGenAI({
         apiKey,
         apiVersion: 'v1beta',
         httpOptions: {
           apiVersion: 'v1beta',
+          timeout: 9000,
+          retryOptions: { attempts: 1 },
           headers: { 'User-Agent': 'aistudio-build' },
         },
       });
@@ -863,22 +878,32 @@ async function parseAndSaveDirectToFirestore(params: {
           `Mês ativo: ${activeMonthKey}`,
           `Remetente: ${defaultPerson}`,
           `Blocos disponíveis: ${JSON.stringify(blocks)}`,
-          `Contas PENDENTES existentes no mês: ${JSON.stringify(
-            existingExpenses.filter((e) => e.status === 'Pendente')
+          `Contas existentes no mês (para baixa automática ou consulta de valor quando o print estiver cortado): ${JSON.stringify(
+            existingExpenses.map((e) => ({
+              id: e.id,
+              description: e.description,
+              amount: e.amount,
+              status: e.status,
+              blockId: e.blockId,
+              category: e.category,
+            }))
           )}`,
-          params.text
-            ? `Mensagem/Legenda: "${params.text}"`
+          combinedTextContext
+            ? `Legenda/Texto: "${combinedTextContext}"`
             : 'Extraia o valor (R$), favorecido/descrição e data deste comprovante PIX ou boleto.',
         ].join('\n'),
       });
 
-      const systemInstruction = `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise a imagem PNG/JPG/PDF do comprovante PIX ou mensagem e extraia o lançamento exato.
+      const systemInstruction = `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise a imagem PNG/JPG ou PDF do comprovante PIX e/ou a legenda e extraia o lançamento exato.
 - transactionType: "income" (entrada/recebido) ou "expense" (saída/pago/transferido).
-- action: "mark_existing_paid" se corresponder a uma conta pendente existente (informe o id em matchedExistingExpenseId), ou "create" se for novo.
-- amount: valor numérico em reais (ex: 150.50). Procure por "Valor", "R$", "Total", "Valor pago" ou "Valor da transferência" na imagem.
-- description: nome do recebedor/favorecido ou descrição curta da despesa.
+- action: "mark_existing_paid" se corresponder a uma conta pendente existente na lista (informe o id em matchedExistingExpenseId), ou "create" se for um lançamento novo.
+- IMPORTANTE SOBRE PRINTS CORTADOS E SINÔNIMOS:
+  * Se o usuário escreveu "Luz" ou o comprovante mostra "COPEL" / "COPELDIS" / "ENERGIA", isso corresponde à conta de luz da família ("Fit Energia" na lista de contas existentes). Se a imagem estiver cortada sem mostrar o valor em R$, use o valor da conta correspondente na lista (ex: Fit Energia = 309.74) e marque action = "mark_existing_paid" com o id dela!
+  * O mesmo vale para "Água" / "Samae" -> "Samae"; "Internet" -> "Help Telecon"; "Casa" -> "Fin. Casa".
+- amount: valor numérico em reais (ex: 150.50). Procure por "Valor", "R$", "Total", "Valor pago" na imagem/PDF ou use o valor da conta existente correspondente.
+- description: se o usuário digitou o nome da despesa na legenda (ex: "Luz", "Lanche da noite", "Mercado"), use esse nome combinado com o favorecido (ou o nome da conta existente).
 - blockId: id do cartão/conta se mencionado (ex: nubank, bradesco, santander, caixa, sicredi, quero_quero), ou "outras" para PIX/boletos/gastos gerais.
-- boletoSubType: "fixa" (luz, água, internet, fixas mensais), "variavel" (parcelado, consórcio, boleto parcelado) ou "mensal" (mercado, farmácia, gasolina, PIX e gastos do mês).
+- boletoSubType: "fixa" (luz, água, internet, fixas mensais), "variavel" (parcelado, consórcio, boleto parcelado) ou "mensal" (mercado, farmácia, gasolina, lanche, PIX e gastos do mês).
 - Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`;
 
       const jsonText = await generateWithFallback(ai, parts, systemInstruction);
@@ -889,9 +914,9 @@ async function parseAndSaveDirectToFirestore(params: {
     }
   }
 
-  if (!raw && params.text) {
+  if (!raw && combinedTextContext) {
     raw = parsePortugueseFinancialTextFallback({
-      text: params.text,
+      text: combinedTextContext,
       blocks,
       existingExpenses,
       activeMonthKey,
@@ -909,16 +934,29 @@ async function parseAndSaveDirectToFirestore(params: {
   }
 
   const transactionType = raw.transactionType === 'income' ? 'income' : 'expense';
-  const matchedExpense =
+
+  // Check if Gemini matched an existing expense OR if our synonym matcher finds a match for caption/description
+  let matchedExpense: ExistingExpenseItem | null =
     transactionType === 'expense' && raw.matchedExistingExpenseId
-      ? existingExpenses.find(
-          (e) => e.id === raw.matchedExistingExpenseId && e.status === 'Pendente'
-        ) || null
+      ? existingExpenses.find((e) => e.id === raw.matchedExistingExpenseId) || null
       : null;
+
+  const parsedAmt = parseFlexibleAmount(raw.amount);
+
+  if (!matchedExpense && transactionType === 'expense') {
+    const searchStr = `${params.text || ''} ${String(raw.description || '')} ${params.pdfExtractedText || ''}`.trim();
+    matchedExpense = findMatchingExistingExpense(
+      searchStr,
+      parsedAmt,
+      existingExpenses
+    );
+  }
+
   const action =
-    matchedExpense && raw.action === 'mark_existing_paid'
+    matchedExpense && matchedExpense.status === 'Pendente'
       ? 'mark_existing_paid'
       : 'create';
+
   const validBlockIds = new Set(blocks.map((b) => b.id));
   const blockId = matchedExpense
     ? matchedExpense.blockId
@@ -931,19 +969,35 @@ async function parseAndSaveDirectToFirestore(params: {
       : 'mensal';
   const category = (ALLOWED_CATEGORIES as readonly string[]).includes(String(raw.category))
     ? String(raw.category)
+    : matchedExpense
+    ? matchedExpense.category
     : 'Outros & Jurídico';
   const person =
     raw.person === 'Rodolfo' || raw.person === 'Viviane' ? raw.person : defaultPerson;
-  const parsedAmt = parseFlexibleAmount(raw.amount);
+
   const amount =
     parsedAmt > 0
       ? parsedAmt
       : matchedExpense && matchedExpense.amount > 0
       ? matchedExpense.amount
       : 0;
-  const description = String(
-    matchedExpense ? matchedExpense.description : raw.description || 'Comprovante PIX'
+
+  // Prefer user's caption if they explicitly typed a name like "Luz", or the matched expense name
+  let description = String(
+    action === 'mark_existing_paid' && matchedExpense
+      ? matchedExpense.description
+      : raw.description || params.text || 'Comprovante PIX'
   ).slice(0, 75);
+
+  if (
+    params.text &&
+    params.text.trim().length >= 2 &&
+    action !== 'mark_existing_paid' &&
+    !normalizeText(description).includes(normalizeText(params.text))
+  ) {
+    description = `${params.text.trim()} - ${description}`.slice(0, 75);
+  }
+
   const date =
     typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date)
       ? raw.date
@@ -965,7 +1019,9 @@ async function parseAndSaveDirectToFirestore(params: {
       : 'Boletos e Fixas → Gastos Mensais';
 
   if (amount <= 0) {
-    throw new Error('Valor R$ 0,00 ou não identificado na imagem');
+    throw new Error(
+      'O valor (R$) não apareceu na imagem/print (o topo com o valor pode ter ficado cortado). Envie o print mostrando o valor ou digite junto na legenda (ex: "Luz 309,74").'
+    );
   }
 
   let savedToCloud = false;
@@ -1081,26 +1137,14 @@ export default async function handler(
         for (const change of changes) {
           const value = change?.value;
 
-          const statuses = Array.isArray(value?.statuses) ? value.statuses : [];
-          for (const st of statuses) {
-            const stStatus = String(st?.status || '');
-            const stRecipient = String(st?.recipient_id || '');
-            const stErrors = Array.isArray(st?.errors) ? JSON.stringify(st.errors) : '';
-            if (stStatus === 'failed' || stErrors) {
-              await recordWebhookDiagnostic(
-                `STATUS ${stStatus.toUpperCase()} p/ ${stRecipient}`,
-                stErrors || 'Falha de entrega reportada pela Meta'
-              );
-            }
-          }
-
           const messages = Array.isArray(value?.messages) ? value.messages : [];
           const contacts = Array.isArray(value?.contacts) ? value.contacts : [];
 
-          if (messages.length > 0) {
-            // Ensure the WhatsApp Business Profile has the Domus Finanças Logo and info
-            ensureWhatsAppContactLogoAndProfile().catch(() => {});
+          if (messages.length === 0) {
+            continue;
           }
+
+          const token = await getActiveWhatsAppToken();
 
           for (const msg of messages) {
             const fromPhone = String(msg?.from || '').replace(/\D/g, '');
@@ -1114,6 +1158,8 @@ export default async function handler(
             let textContent = '';
             let mediaBase64: string | undefined;
             let mediaMimeType: string | undefined;
+            let pdfExtractedText: string | undefined;
+            let documentFilename: string | undefined;
             let mediaDownloadError = '';
 
             if (msgType === 'text') {
@@ -1121,36 +1167,45 @@ export default async function handler(
             } else if (msgType === 'image') {
               textContent = String(msg?.image?.caption || '').trim();
               const mediaId = String(msg?.image?.id || '');
-              // Immediate visual interaction on the user's PNG/JPG message (blue ticks + hourglass reaction)
-              await sendWhatsAppReadAndReaction({
-                toPhone: fromPhone,
-                messageId: incomingMsgId,
-                emoji: '⏳',
-              });
-              const media = await downloadWhatsAppMediaAsBase64(mediaId);
+              const [, media] = await Promise.all([
+                sendWhatsAppReadAndReaction({
+                  token,
+                  toPhone: fromPhone,
+                  messageId: incomingMsgId,
+                  emoji: '⏳',
+                }),
+                downloadWhatsAppMediaAsBase64(token, mediaId),
+              ]);
               if ('base64' in media) {
                 mediaBase64 = media.base64;
                 mediaMimeType = media.mimeType;
+                pdfExtractedText = media.pdfExtractedText;
               } else {
                 mediaDownloadError = media.error;
               }
             } else if (msgType === 'document') {
               textContent = String(msg?.document?.caption || '').trim();
+              documentFilename = String(msg?.document?.filename || '').trim();
               const mediaId = String(msg?.document?.id || '');
-              await sendWhatsAppReadAndReaction({
-                toPhone: fromPhone,
-                messageId: incomingMsgId,
-                emoji: '⏳',
-              });
-              const media = await downloadWhatsAppMediaAsBase64(mediaId);
+              const [, media] = await Promise.all([
+                sendWhatsAppReadAndReaction({
+                  token,
+                  toPhone: fromPhone,
+                  messageId: incomingMsgId,
+                  emoji: '⏳',
+                }),
+                downloadWhatsAppMediaAsBase64(token, mediaId),
+              ]);
               if ('base64' in media) {
                 mediaBase64 = media.base64;
                 mediaMimeType = media.mimeType;
+                pdfExtractedText = media.pdfExtractedText;
               } else {
                 mediaDownloadError = media.error;
               }
             } else {
               await sendWhatsAppReadAndReaction({
+                token,
                 toPhone: fromPhone,
                 messageId: incomingMsgId,
                 emoji: '⚠️',
@@ -1158,20 +1213,21 @@ export default async function handler(
               const unsupportedMsg =
                 '⚠️ *Domus Finanças:* Formato não suportado. Envie uma imagem (PNG/JPG), PDF de comprovante PIX ou mensagem de texto com o valor (ex: *"Paguei 150,00 mercado"*).';
               const replyRes = await sendWhatsAppTextReply(
+                token,
                 fromPhone,
                 unsupportedMsg,
                 incomingMsgId
               );
               await recordWebhookDiagnostic(
                 `De ${fromPhone} (${msgType})`,
-                `Reply: ${replyRes.details}`,
-                unsupportedMsg
+                `Reply: ${replyRes.details}`
               );
               continue;
             }
 
             if (!textContent && !mediaBase64) {
               await sendWhatsAppReadAndReaction({
+                token,
                 toPhone: fromPhone,
                 messageId: incomingMsgId,
                 emoji: '❌',
@@ -1184,14 +1240,14 @@ export default async function handler(
                 .filter(Boolean)
                 .join('\n');
               const replyRes = await sendWhatsAppTextReply(
+                token,
                 fromPhone,
                 dlErrMsg,
                 incomingMsgId
               );
               await recordWebhookDiagnostic(
                 `ERR MÍDIA ${fromPhone}`,
-                `${mediaDownloadError || 'Sem conteúdo'} | Meta:${replyRes.details}`,
-                dlErrMsg
+                `${mediaDownloadError || 'Sem conteúdo'} | Meta:${replyRes.details}`
               );
               continue;
             }
@@ -1201,14 +1257,9 @@ export default async function handler(
                 text: textContent || undefined,
                 imageBase64: mediaBase64,
                 imageMimeType: mediaMimeType,
+                pdfExtractedText,
+                documentFilename,
                 senderName,
-              });
-
-              // React with ✅ on the user's message and mark read!
-              await sendWhatsAppReadAndReaction({
-                toPhone: fromPhone,
-                messageId: incomingMsgId,
-                emoji: '✅',
               });
 
               const replySummary = [
@@ -1225,40 +1276,51 @@ export default async function handler(
                 .filter(Boolean)
                 .join('\n');
 
-              const replyRes = await sendWhatsAppTextReply(
-                fromPhone,
-                replySummary,
-                incomingMsgId
-              );
+              const [, replyRes] = await Promise.all([
+                sendWhatsAppReadAndReaction({
+                  token,
+                  toPhone: fromPhone,
+                  messageId: incomingMsgId,
+                  emoji: '✅',
+                }),
+                sendWhatsAppTextReply(
+                  token,
+                  fromPhone,
+                  replySummary,
+                  incomingMsgId
+                ),
+              ]);
+
               await recordWebhookDiagnostic(
                 `OK ${fromPhone}: ${parsed.description} (${formatBRLServer(parsed.amount)})`,
-                `Cloud:${parsed.savedToCloud} | Mime:${mediaMimeType || 'text'} | Meta:${replyRes.details}`,
-                replySummary
+                `Cloud:${parsed.savedToCloud} | Mime:${mediaMimeType || 'text'} | Meta:${replyRes.details}`
               );
             } catch (err) {
-              // React with ❌ on the user's message so they immediately see it failed!
-              await sendWhatsAppReadAndReaction({
-                toPhone: fromPhone,
-                messageId: incomingMsgId,
-                emoji: '❌',
-              });
-
               const errDetail = err instanceof Error ? err.message : 'valor não identificado';
               const errorReply = [
                 '❌ *Deu errado ao lançar no Domus Finanças.*',
                 `• *Motivo:* ${errDetail}`,
-                '💡 *Como resolver:* Envie um comprovante PIX nítido (PNG, JPG ou PDF) ou escreva o valor na legenda (ex: *"Paguei 150,00 mercado"* ou *"Recebi 800 extra"*).',
+                '💡 *Como resolver:* Envie um comprovante PIX mostrando o valor (R$) ou escreva o valor na legenda (ex: *"Luz 309,74"* ou *"Paguei 150,00 mercado"*).',
               ].join('\n');
 
-              const replyRes = await sendWhatsAppTextReply(
-                fromPhone,
-                errorReply,
-                incomingMsgId
-              );
+              const [, replyRes] = await Promise.all([
+                sendWhatsAppReadAndReaction({
+                  token,
+                  toPhone: fromPhone,
+                  messageId: incomingMsgId,
+                  emoji: '❌',
+                }),
+                sendWhatsAppTextReply(
+                  token,
+                  fromPhone,
+                  errorReply,
+                  incomingMsgId
+                ),
+              ]);
+
               await recordWebhookDiagnostic(
-                `ERR ${fromPhone}: "${textContent.slice(0, 35) || mediaMimeType || 'img'}"`,
-                `Err:${errDetail} | Meta:${replyRes.details}`,
-                errorReply
+                `ERR ${fromPhone}: "${textContent.slice(0, 35) || documentFilename || mediaMimeType || 'img'}"`,
+                `Err:${errDetail} | Meta:${replyRes.details}`
               );
             }
           }

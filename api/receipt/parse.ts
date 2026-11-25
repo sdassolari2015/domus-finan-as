@@ -1,5 +1,7 @@
 import { GoogleGenAI, Type } from '@google/genai';
 
+export const maxDuration = 60;
+
 const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/jpeg',
   'image/jpg',
@@ -51,8 +53,8 @@ const DEFAULT_BLOCKS: BlockItem[] = [
 ];
 
 const MODEL_FALLBACK_CHAIN = [
-  'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-3.1-flash-lite-preview',
   'gemini-3-flash-preview',
@@ -315,6 +317,8 @@ export default async function handler(
         apiVersion: 'v1beta',
         httpOptions: {
           apiVersion: 'v1beta',
+          timeout: 9000,
+          retryOptions: { attempts: 1 },
           headers: { 'User-Agent': 'aistudio-build' },
         },
       });
@@ -336,11 +340,14 @@ export default async function handler(
 
       for (const modelName of MODEL_FALLBACK_CHAIN) {
         try {
+          const isGemini25 = modelName.startsWith('gemini-2.5');
           const response = await ai.models.generateContent({
             model: modelName,
             contents: { parts },
             config: {
               systemInstruction: `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise o comprovante PIX ou mensagem e classifique no local exato. Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`,
+              temperature: 0.1,
+              ...(isGemini25 ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
               responseMimeType: 'application/json',
               responseSchema: {
                 type: Type.OBJECT,
@@ -385,33 +392,6 @@ export default async function handler(
           }
         } catch (err) {
           lastModelErr = err;
-        }
-      }
-
-      if (!raw) {
-        for (const modelName of MODEL_FALLBACK_CHAIN) {
-          try {
-            const response = await ai.models.generateContent({
-              model: modelName,
-              contents: {
-                parts: [
-                  ...parts,
-                  {
-                    text: 'Responda APENAS um JSON válido com as chaves: {"transactionType":"expense","action":"create","matchedExistingExpenseId":"","description":"Favorecido","amount":0.00,"date":"YYYY-MM-DD","status":"Pago","blockId":"outras","boletoSubType":"mensal","category":"Outros & Jurídico","person":"Rodolfo","confidenceNote":"OK"}',
-                  },
-                ],
-              },
-            });
-            const responseText = (response.text ?? '').trim();
-            const firstBrace = responseText.indexOf('{');
-            const lastBrace = responseText.lastIndexOf('}');
-            if (firstBrace !== -1 && lastBrace > firstBrace) {
-              raw = JSON.parse(responseText.slice(firstBrace, lastBrace + 1));
-              break;
-            }
-          } catch (err) {
-            lastModelErr = err;
-          }
         }
       }
     }

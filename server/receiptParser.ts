@@ -75,6 +75,8 @@ function getGeminiClient(): GoogleGenAI {
     apiVersion: 'v1beta',
     httpOptions: {
       apiVersion: 'v1beta',
+      timeout: 9000,
+      retryOptions: { attempts: 1 },
       headers: {
         'User-Agent': 'aistudio-build',
       },

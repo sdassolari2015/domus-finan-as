@@ -1,10 +1,10 @@
 {
-  "version": "2.9.6",
+  "version": "2.9.7",
   "releaseDate": "Versão Atual",
-  "title": "Leitura de Comprovantes PNG no WhatsApp, Foto de Perfil & Retorno Automático",
+  "title": "Leitura Ultra-Rápida de Comprovantes PNG/PDF & Baixa Automática por Sinônimos",
   "changes": [
-    "Leitura de Comprovantes PNG/JPG/PDF no WhatsApp: Corrigido o motor Gemini v1beta com detecção binária de PNG para reconhecer e lançar comprovantes em imagem enviados no WhatsApp.",
-    "Interação Automática do Contato no WhatsApp: Ao enviar mensagem ou comprovante, o contato marca como lido (✓✓), reage na mensagem com ✅ (lançado) ou ❌ (erro) e envia a confirmação detalhada.",
-    "Logo do Domus Finanças no Contato: Sincronização automática da logo oficial do app no perfil WhatsApp Business + opção de QR Code direto."
+    "Leitura Ultra-Rápida de Imagens e PDFs (~1,5s): Desativado o atraso de pensamento dinâmico (thinkingBudget: 0) para reconhecer comprovantes PNG, JPG e PDFs bancários na mesma hora.",
+    "Reconhecimento de Prints Cortados e Sinônimos: Se o print estiver sem o topo do valor mas você escrever o nome da conta na legenda (ex: \"Luz\" -> Fit Energia R$ 309,74; \"Água\" -> Samae; \"Internet\" -> Help Telecon), o sistema identifica a conta na planilha e dá baixa automática.",
+    "Extração Direta de Texto de PDFs Bancários + Logo e Reações (✅ / ❌) no Contato do WhatsApp."
   ]
 }
