@@ -1,10 +1,10 @@
 {
-  "version": "2.9.9",
+  "version": "3.0.0",
   "releaseDate": "Versão Atual",
-  "title": "Login Obrigatório com Conta Google & Controle de Permissões Aprovadas",
+  "title": "Visual Mais Limpo, Conexão WhatsApp Simplificada & Link Oficial GitHub/Vercel",
   "changes": [
-    "Acesso Exclusivo com Conta Google: Apenas contas Google cadastradas e aprovadas pelo administrador conseguem entrar e visualizar a planilha.",
-    "Bloqueio Automático + Solicitação de Acesso: Contas não aprovadas são bloqueadas na hora e podem solicitar aprovação para o administrador liberar ou recusar com 1 clique.",
-    "Gerenciador de Permissões em Tempo Real: Cadastre e aprove novos e-mails Google ou revogue acessos a qualquer momento no botão Permissões no topo do app."
+    "Conexão WhatsApp Simplificada: Removidas caixas duplicadas, tutoriais antigos da Meta e botões de configuração já concluídos.",
+    "Link Oficial Definitivo: Tela de Instalação e instalador para PC sempre apontam para o link oficial publicado via GitHub/Vercel (domus-finan-as.vercel.app).",
+    "Barra Superior Mais Limpa: Removido excesso de textos e botões secundários no topo do aplicativo."
   ]
 }

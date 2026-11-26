@@ -8,6 +8,7 @@ import {
   Copy,
   Check,
   Share2,
+  RotateCcw,
 } from 'lucide-react';
 import { MonthLedger } from '../types/finance';
 import { PERMANENT_APP_LINK } from '../data/appVersion';
@@ -24,6 +25,7 @@ interface InstallNotebookModalProps {
   isInstallable?: boolean;
   isInstalled?: boolean;
   onTriggerPWAInstall?: () => Promise<boolean>;
+  onRestoreInitialData?: () => void;
   onShowToast: (msg: string) => void;
 }
 
@@ -32,6 +34,7 @@ export const InstallNotebookModal: React.FC<InstallNotebookModalProps> = ({
   onClose,
   ledgers,
   onImportLedgers,
+  onRestoreInitialData,
   onShowToast,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -39,13 +42,8 @@ export const InstallNotebookModal: React.FC<InstallNotebookModalProps> = ({
 
   if (!isOpen) return null;
 
-  const directAppUrl =
-    typeof window !== 'undefined' &&
-    window.location.origin.startsWith('http') &&
-    !window.location.origin.includes('localhost') &&
-    !window.location.origin.includes('127.0.0.1')
-      ? window.location.origin
-      : PERMANENT_APP_LINK;
+  // Always point to the official published app URL (GitHub / Vercel), never to a temporary preview URL
+  const directAppUrl = PERMANENT_APP_LINK;
 
   const handleCopyDirectLink = async () => {
     try {
@@ -156,14 +154,14 @@ export const InstallNotebookModal: React.FC<InstallNotebookModalProps> = ({
             <div className="flex items-center justify-between gap-2">
               <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                 <Smartphone className="w-4 h-4 text-slate-800" />
-                2. Acesso para iPhone e Tablet (Link ou App Portátil)
+                2. Link Oficial de Acesso — Celular, Tablet e PC
               </h3>
               <span className="px-2 py-0.5 text-[10px] font-bold bg-slate-800 text-white rounded">
-                Celular / Tablet
+                GitHub / Vercel
               </span>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Copie o link abaixo, cole no navegador do seu iPhone, Tablet ou outro computador e salve a página na tela de início:
+              Este é o link oficial definitivo publicado a partir do seu GitHub. Copie e abra no iPhone, Tablet ou computador e salve na tela de início:
             </p>
 
             <div className="p-2.5 bg-white border border-slate-300 rounded-lg font-mono text-xs text-slate-800 truncate select-all">
@@ -213,7 +211,7 @@ export const InstallNotebookModal: React.FC<InstallNotebookModalProps> = ({
                 Exportar ou restaurar cópia local das contas da família.
               </p>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={handleExportJSONBackup}
@@ -230,6 +228,20 @@ export const InstallNotebookModal: React.FC<InstallNotebookModalProps> = ({
                 <Upload className="w-3.5 h-3.5" />
                 Restaurar .json
               </button>
+              {onRestoreInitialData && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onRestoreInitialData();
+                    onClose();
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap"
+                  title="Restaurar dados originais da planilha inicial"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Restaurar Padrão
+                </button>
+              )}
               <input
                 ref={fileInputRef}
                 type="file"

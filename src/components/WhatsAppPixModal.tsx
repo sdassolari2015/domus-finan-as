@@ -8,22 +8,18 @@ import {
   AlertCircle,
   Loader2,
   FileText,
-  Copy,
-  Check,
   Smartphone,
   ArrowUpRight,
   ArrowDownLeft,
-  Sparkles,
   Trash2,
-  QrCode,
-  RefreshCw,
   Mic,
   Square,
   Volume2,
   AlertTriangle,
+  KeyRound,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
-import { doc, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
-import { db, HOUSEHOLD_ID } from '../services/firebase';
 import {
   AccountBlockId,
   BoletoSubType,
@@ -131,22 +127,14 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
   } | null>(null);
   const [feed, setFeed] = useState<FeedEntry[]>([]);
   const [waStatus, setWaStatus] = useState<WhatsAppServerStatus | null>(null);
-  const [copiedWebhook, setCopiedWebhook] = useState(false);
   const [testPhoneInput, setTestPhoneInput] = useState('5543996040935');
   const [newTokenInput, setNewTokenInput] = useState('');
+  const [showTokenEditor, setShowTokenEditor] = useState(false);
   const [isSendingTest, setIsSendingTest] = useState(false);
   const [testResultMsg, setTestResultMsg] = useState<{
     ok: boolean;
     text: string;
   } | null>(null);
-  const [qrBridgeStatus, setQrBridgeStatus] = useState<
-    'connecting' | 'qr_ready' | 'connected'
-  >('connecting');
-  const [qrBridgeData, setQrBridgeData] = useState<string>('');
-  const [qrBridgeLogs, setQrBridgeLogs] = useState<
-    Array<{ id: string; description: string; notes: string }>
-  >([]);
-  const [isResettingQr, setIsResettingQr] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
 
@@ -171,44 +159,20 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
     if (!isOpen) return;
     fetch('/api/whatsapp/status')
       .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data) setWaStatus(data);
+      .then((data: WhatsAppServerStatus | null) => {
+        if (data) {
+          setWaStatus(data);
+          if (data.metaTokenValid === false) {
+            setShowTokenEditor(true);
+          }
+        }
       })
       .catch(() => {});
-
-    const qrRef = doc(db, 'households', HOUSEHOLD_ID, 'ledgers', '2099-10');
-    const unsub = onSnapshot(
-      qrRef,
-      (snap) => {
-        if (!snap.exists()) return;
-        const d = snap.data();
-        const incomes = Array.isArray(d?.incomes) ? d.incomes : [];
-        const qrState = incomes.find((i: { id?: string }) => i?.id === 'qr-state');
-        if (qrState) {
-          const st = String(qrState.description || 'connecting');
-          if (st === 'qr_ready' || st === 'connected' || st === 'connecting') {
-            setQrBridgeStatus(st);
-          }
-          setQrBridgeData(String(qrState.date || ''));
-        }
-        const exps = Array.isArray(d?.expenses) ? d.expenses : [];
-        setQrBridgeLogs(
-          exps.slice(0, 8).map((e: { id?: string; description?: string; notes?: string }) => ({
-            id: String(e?.id || ''),
-            description: String(e?.description || ''),
-            notes: String(e?.notes || ''),
-          }))
-        );
-      },
-      () => {}
-    );
-    return () => unsub();
   }, [isOpen, pendingWhatsAppItems.length]);
 
   if (!isOpen) return null;
 
   const effectiveBlocks = getEffectiveBlocks(ledger);
-  const webhookUrl = 'https://domus-finan-as.vercel.app/api/whatsapp/webhook';
 
   const readFileAsAttachment = (file: File) => {
     const allowed = [
@@ -495,17 +459,6 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
     ]);
   };
 
-  const handleCopyWebhook = async () => {
-    try {
-      await navigator.clipboard.writeText(webhookUrl);
-      setCopiedWebhook(true);
-      onShowToast('URL do Webhook do WhatsApp copiada!');
-      window.setTimeout(() => setCopiedWebhook(false), 3000);
-    } catch {
-      onShowToast(`URL do Webhook: ${webhookUrl}`);
-    }
-  };
-
   const handleSendTestWhatsApp = async () => {
     const cleanPhone = testPhoneInput.replace(/\D/g, '');
     const cleanToken = newTokenInput.replace(/\s+/g, '').trim();
@@ -656,10 +609,12 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
               }`}
             >
               <Smartphone className="w-3.5 h-3.5" />
-              <span>Conectar Número WhatsApp</span>
-              {waStatus?.connected && (
+              <span>Conexão WhatsApp</span>
+              {waStatus?.metaTokenValid === false ? (
+                <span className="w-2 h-2 rounded-full bg-red-500" />
+              ) : waStatus?.connected ? (
                 <span className="w-2 h-2 rounded-full bg-emerald-400" />
-              )}
+              ) : null}
             </button>
           </div>
 
@@ -696,11 +651,12 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                 type="button"
                 onClick={() => {
                   setActiveSubTab('connect');
+                  setShowTokenEditor(true);
                   window.setTimeout(() => tokenInputRef.current?.focus(), 120);
                 }}
                 className="px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white text-xs font-bold rounded-lg whitespace-nowrap shrink-0"
               >
-                Renovar Token Agora
+                Atualizar Token
               </button>
             </div>
           )}
@@ -1047,388 +1003,127 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
               </div>
             </>
           ) : (
-            /* ==================== ABA 2: CONECTAR SEU WHATSAPP POR QR CODE (DIRETO, SEM BLOQUEIO 130497 DA META) ==================== */
+            /* ==================== ABA 2: STATUS DA CONEXÃO WHATSAPP ==================== */
             <div className="space-y-4">
-              {/* Direct QR Code Bridge Card */}
-              <div className="p-4 rounded-xl border-2 border-emerald-600 bg-emerald-50/70 space-y-3">
-                <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <div className="flex items-center gap-2">
-                    <QrCode className="w-5 h-5 text-emerald-800 shrink-0" />
-                    <span className="font-bold text-sm text-emerald-950">
-                      Conexão Direta com seu WhatsApp por QR Code (Sem Bloqueio da Meta)
-                    </span>
-                  </div>
-                  <span
-                    className={`px-2.5 py-0.5 rounded-md font-bold text-[11px] ${
-                      qrBridgeStatus === 'connected'
-                        ? 'bg-emerald-700 text-white'
-                        : qrBridgeStatus === 'qr_ready'
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'bg-slate-200 text-slate-700'
-                    }`}
-                  >
-                    {qrBridgeStatus === 'connected'
-                      ? `Conectado (+${qrBridgeData || '5543996040935'})`
-                      : qrBridgeStatus === 'qr_ready'
-                      ? 'QR Code Pronto para Ler'
-                      : 'Gerando QR Code...'}
-                  </span>
-                </div>
-
-                {qrBridgeStatus === 'connected' ? (
-                  <div className="p-4 bg-white border border-emerald-300 rounded-xl space-y-2.5">
-                    <div className="flex items-center gap-2 text-emerald-800 font-bold text-xs">
-                      <CheckCircle2 className="w-4 h-4 shrink-0" />
-                      <span>
-                        Seu WhatsApp está conectado! Agora você não precisa abrir o aplicativo para lançar:
-                      </span>
-                    </div>
-                    <ol className="text-xs text-slate-700 space-y-1.5 list-decimal pl-4">
-                      <li>
-                        Abra o <strong>WhatsApp no seu celular</strong> e entre na conversa com <strong>Você mesmo ("Você")</strong>.
-                      </li>
-                      <li>
-                        Mande apenas a mensagem (ex: <strong>"Paguei 150,00 mercado"</strong>, <strong>"Gasolina 50,00"</strong>, <strong>"Recebi 800 extra"</strong>) ou envie a <strong>foto/PDF do comprovante PIX</strong>.
-                      </li>
-                      <li>
-                        O Domus Finanças lê na mesma hora, <strong>lança sozinho no local exato da planilha</strong> e responde no seu WhatsApp confirmando!
-                      </li>
-                    </ol>
-                  </div>
-                ) : (
-                  <div className="p-4 bg-white border border-emerald-200 rounded-xl flex flex-col sm:flex-row items-center gap-4">
-                    <div className="w-48 h-48 rounded-xl border border-slate-200 bg-white flex items-center justify-center p-2 shrink-0 shadow-xs">
-                      {qrBridgeStatus === 'qr_ready' && qrBridgeData.startsWith('data:image/') ? (
-                        <img
-                          src={qrBridgeData}
-                          alt="QR Code do WhatsApp Domus Finanças"
-                          className="w-full h-full object-contain"
-                        />
-                      ) : (
-                        <div className="flex flex-col items-center gap-2 text-xs text-slate-500 text-center">
-                          <Loader2 className="w-6 h-6 animate-spin text-emerald-700" />
-                          <span>Carregando QR Code do WhatsApp...</span>
-                        </div>
-                      )}
-                    </div>
-                    <div className="space-y-2 text-xs text-slate-700">
-                      <p className="font-bold text-slate-900 text-sm">
-                        Leia este QR Code com seu celular (leva 5 segundos):
-                      </p>
-                      <ol className="space-y-1.5 list-decimal pl-4">
-                        <li>
-                          Abra o <strong>WhatsApp</strong> no seu celular (<strong>+55 43 99604-0935</strong>).
-                        </li>
-                        <li>
-                          Toque no menu → <strong>Aparelhos conectados</strong> → <strong>Conectar um aparelho</strong>.
-                        </li>
-                        <li>
-                          Aponte a câmera do celular para o <strong>QR Code ao lado</strong>.
-                        </li>
-                        <li>
-                          Assim que conectar, abra a conversa com <strong>Você mesmo ("Você")</strong> no WhatsApp e mande <em>"Paguei 150,00 mercado"</em> ou um comprovante PIX — ele lança sozinho na planilha!
-                        </li>
-                      </ol>
-                    </div>
-                  </div>
-                )}
-
-                <div className="flex items-center justify-between gap-2 flex-wrap pt-1">
-                  <span className="text-[11px] text-emerald-900">
-                    Funciona direto na conversa com você mesmo no WhatsApp, sem o bloqueio internacional 130497 da Meta.
-                  </span>
-                  <button
-                    type="button"
-                    disabled={isResettingQr}
-                    onClick={async () => {
-                      setIsResettingQr(true);
-                      try {
-                        const qrRef = doc(db, 'households', HOUSEHOLD_ID, 'ledgers', '2099-10');
-                        await setDoc(qrRef, {
-                          householdId: HOUSEHOLD_ID,
-                          monthKey: '2099-10',
-                          label: 'Conexão Direta WhatsApp QR Code',
-                          year: 2099,
-                          month: 10,
-                          incomes: [
-                            {
-                              id: 'qr-state',
-                              person: 'Família',
-                              description: 'connecting',
-                              amount: Date.now(),
-                              date: '',
-                            },
-                            {
-                              id: 'qr-cmd',
-                              person: 'Família',
-                              description: 'reset_qr',
-                              amount: Date.now(),
-                              date: '',
-                            },
-                          ],
-                          expenses: [],
-                          updatedAt: serverTimestamp(),
-                        });
-                        onShowToast('Gerando novo QR Code do WhatsApp...');
-                      } finally {
-                        setTimeout(() => setIsResettingQr(false), 2000);
-                      }
-                    }}
-                    className="px-3 py-1.5 bg-white hover:bg-emerald-100 text-emerald-950 border border-emerald-400 rounded-lg text-xs font-bold flex items-center gap-1.5"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isResettingQr ? 'animate-spin' : ''}`} />
-                    <span>{qrBridgeStatus === 'connected' ? 'Trocar / Gerar Novo QR Code' : 'Atualizar QR Code'}</span>
-                  </button>
-                </div>
-
-                {qrBridgeLogs.length > 0 && (
-                  <div className="pt-2 border-t border-emerald-200 space-y-1">
-                    <span className="text-[11px] font-bold text-emerald-950">
-                      Últimos lançamentos automáticos recebidos pelo WhatsApp:
-                    </span>
-                    {qrBridgeLogs.map((lg) => (
-                      <div
-                        key={lg.id}
-                        className="text-[11px] bg-white px-2.5 py-1.5 rounded border border-emerald-200 flex items-center justify-between gap-2"
-                      >
-                        <span className="font-semibold text-slate-900">{lg.description}</span>
-                        <span className="text-emerald-800">{lg.notes}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              {/* Concise Connection Status Card */}
               <div
-                className={`p-4 rounded-xl border text-xs space-y-1.5 ${
-                  waStatus?.connected
-                    ? 'bg-emerald-50 border-emerald-200 text-emerald-950'
-                    : 'bg-slate-50 border-slate-200 text-slate-800'
+                className={`p-4 rounded-xl border text-xs space-y-2 ${
+                  waStatus?.metaTokenValid === false
+                    ? 'bg-red-50 border-red-200 text-red-950'
+                    : 'bg-emerald-50 border-emerald-200 text-emerald-950'
                 }`}
               >
                 <div className="flex items-center justify-between gap-2">
-                  <span className="font-bold text-sm flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-emerald-700" />
-                    {waStatus?.connected
-                      ? 'Número do WhatsApp Conectado e Ativo!'
-                      : 'Servidor Oficial do WhatsApp Pronto para Conectar seu Número'}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {waStatus?.metaTokenValid === false ? (
+                      <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                    ) : (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                    )}
+                    <span className="font-bold text-sm">
+                      {waStatus?.metaTokenValid === false
+                        ? 'Token do WhatsApp Expirado'
+                        : 'WhatsApp Conectado'}
+                    </span>
+                  </div>
                   <span
                     className={`px-2 py-0.5 rounded font-bold text-[10px] ${
-                      waStatus?.connected
-                        ? 'bg-emerald-700 text-white'
-                        : 'bg-amber-100 text-amber-900'
+                      waStatus?.metaTokenValid === false
+                        ? 'bg-red-600 text-white'
+                        : 'bg-emerald-700 text-white'
                     }`}
                   >
-                    {waStatus?.connected ? 'Conectado' : 'Aguardando Número Meta'}
+                    {waStatus?.metaTokenValid === false ? 'Atenção' : 'Ativo'}
                   </span>
                 </div>
-                <p className="leading-relaxed text-slate-600">
-                  A Meta (dona do WhatsApp) exige que o número seja ativado na conta oficial do <strong>Meta for Developers</strong> (gratuito para uso pessoal/teste). O servidor do Domus já está 100% programado para receber seus comprovantes PIX e responder confirmando o lançamento direto no seu WhatsApp.
+
+                <p className="leading-relaxed text-slate-700">
+                  {waStatus?.metaTokenValid === false
+                    ? 'Cole um novo token permanente abaixo para reativar comprovantes, áudios e confirmações no WhatsApp.'
+                    : 'Comprovantes (imagem/PDF), áudios e mensagens enviados no WhatsApp são lançados automaticamente com confirmação na conversa.'}
                 </p>
+
                 {waStatus?.metaPhoneDisplay && (
-                  <p className="text-xs font-bold text-emerald-800">
-                    Número do Robô Ativo na Meta: {waStatus.metaPhoneDisplay} ({waStatus.metaVerifiedName || 'Test Number'})
+                  <p className="text-xs font-semibold text-emerald-900">
+                    Número ativo: <span className="font-mono">{waStatus.metaPhoneDisplay}</span>
                   </p>
                 )}
-                <div className="pt-2 mt-2 border-t border-emerald-200/70 flex items-center justify-between gap-3 flex-wrap">
-                  <div className="flex items-center gap-2.5">
-                    <img
-                      src="/domus-logo.png"
-                      alt="Logo Domus Finanças"
-                      className="w-9 h-9 rounded-full object-cover border border-emerald-400 shadow-xs bg-slate-900"
-                    />
-                    <div className="text-[11px]">
-                      <span className="font-bold text-slate-900 block">
-                        Logo Oficial Domus Finanças no Contato &amp; Resposta Automática
-                      </span>
-                      <span className="text-slate-600">
-                        Reconhece imagens PNG/JPG/PDF, reage com ✅/❌ e envia confirmação do lançamento
-                      </span>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        onShowToast('Enviando logo do Domus Finanças para o perfil do contato no WhatsApp...');
-                        const res = await fetch('/api/whatsapp/status', {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({
-                            action: 'sync_profile_logo',
-                            newAccessToken: newTokenInput.trim() || undefined,
-                          }),
-                        });
-                        const data = await res.json().catch(() => ({}));
-                        if (res.ok && data?.ok) {
-                          onShowToast('✅ Logo do Domus Finanças aplicada com sucesso no perfil do contato!');
-                        } else {
-                          onShowToast('Perfil atualizado! (Em números de teste 555 da Meta a foto pode levar alguns minutos).');
-                        }
-                      } catch {
-                        onShowToast('Não foi possível sincronizar a foto agora.');
-                      }
-                    }}
-                    className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg text-[11px] font-bold whitespace-nowrap shrink-0"
-                  >
-                    Aplicar Logo no Contato
-                  </button>
-                </div>
+
                 {waStatus?.metaError && (
-                  <p className="text-xs font-bold text-red-700 bg-red-50 border border-red-200 rounded p-2">
-                    Aviso da Meta: {waStatus.metaError}
+                  <p className="text-xs font-medium text-red-700 bg-white/80 border border-red-200 rounded-lg p-2">
+                    {waStatus.metaError}
                   </p>
                 )}
               </div>
 
-              {/* Test Send Direct to WhatsApp & Instant Token Update */}
-              <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-2.5">
-                <label className="block text-xs font-bold text-slate-900">
-                  Atualizar Token da Meta e Testar no seu WhatsApp Agora
-                </label>
-                <input
-                  ref={tokenInputRef}
-                  type="password"
-                  value={newTokenInput}
-                  onChange={(e) => setNewTokenInput(e.target.value)}
-                  placeholder="Cole aqui o novo Token da Meta (EAA...) para reativar reações (✅/❌), comprovantes e áudios"
-                  className="w-full px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg"
-                />
-                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                  <input
-                    type="text"
-                    value={testPhoneInput}
-                    onChange={(e) => setTestPhoneInput(e.target.value)}
-                    placeholder="5543996040935"
-                    className="flex-1 px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg"
-                  />
-                  <button
-                    type="button"
-                    disabled={isSendingTest}
-                    onClick={() => void handleSendTestWhatsApp()}
-                    className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-300 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 shrink-0"
-                  >
-                    {isSendingTest ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>Enviando...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Send className="w-3.5 h-3.5" />
-                        <span>{newTokenInput.trim() ? 'Salvar Token e Testar' : 'Testar no Meu WhatsApp'}</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-                {testResultMsg && (
-                  <div
-                    className={`p-2.5 rounded-lg border text-xs ${
-                      testResultMsg.ok
-                        ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
-                        : 'bg-red-50 border-red-200 text-red-800'
-                    }`}
-                  >
-                    {testResultMsg.text}
-                  </div>
-                )}
+              {/* Compact Collapsible Token Update (only expanded when needed) */}
+              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowTokenEditor((prev) => !prev)}
+                  className="w-full px-4 py-3 flex items-center justify-between gap-2 text-left hover:bg-slate-50 transition-colors"
+                >
+                  <span className="flex items-center gap-2 text-xs font-bold text-slate-800">
+                    <KeyRound className="w-4 h-4 text-slate-500" />
+                    Atualizar Token ou Enviar Teste
+                  </span>
+                  {showTokenEditor ? (
+                    <ChevronUp className="w-4 h-4 text-slate-400" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-slate-400" />
+                  )}
+                </button>
 
-                {/* Permanent Token Guide so emoji reactions never expire after 24h */}
-                <div className="pt-2.5 mt-2 border-t border-slate-200 space-y-1.5 text-[11px] text-slate-600">
-                  <p className="font-bold text-slate-800">
-                    Dica: Como criar um Token Permanente (que NUNCA expira em 24h):
-                  </p>
-                  <ol className="list-decimal pl-4 space-y-1">
-                    <li>
-                      Acesse <strong>business.facebook.com</strong> → <strong>Configurações do Negócio</strong> → <strong>Usuários do sistema</strong> → clique em <strong>Adicionar</strong> (nome: <em>Domus</em>, função: <em>Administrador</em>).
-                    </li>
-                    <li>
-                      Clique em <strong>Atribuir ativos</strong> → selecione seu app do WhatsApp com controle total.
-                    </li>
-                    <li>
-                      Clique em <strong>Gerar novo token</strong> → escolha validade <strong>Nunca expira</strong> e marque <code>whatsapp_business_messaging</code> e <code>whatsapp_business_management</code>.
-                    </li>
-                    <li>
-                      Cole o token permanente gerado (<code>EAA...</code>) na caixa acima e clique em <strong>Salvar Token e Testar</strong> (as reações ✅/❌ e leitura de áudios/comprovantes ficam ativas para sempre!).
-                    </li>
-                  </ol>
-                </div>
-              </div>
-
-              {/* Webhook URL to paste in Meta */}
-              <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-2">
-                <label className="block text-xs font-bold text-slate-900">
-                  URL de Callback (Webhook) do Domus Finanças
-                </label>
-                <div className="flex items-center gap-2">
-                  <div className="flex-1 p-2.5 bg-slate-50 border border-slate-300 rounded-lg font-mono text-[11px] text-slate-800 truncate select-all">
-                    {webhookUrl}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleCopyWebhook}
-                    className="px-3 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-lg flex items-center gap-1.5 shrink-0"
-                  >
-                    {copiedWebhook ? (
-                      <>
-                        <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        <span>Copiado</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3.5 h-3.5" />
-                        <span>Copiar</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {/* 4-Step Guide */}
-              <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-3">
-                <h3 className="text-xs font-bold text-slate-900">
-                  Como ativar seu número gratuito no WhatsApp (4 passos):
-                </h3>
-                <ol className="space-y-2 text-xs text-slate-700 list-decimal pl-4">
-                  <li>
-                    Acesse <strong>developers.facebook.com</strong>, crie um aplicativo do tipo <em>Empresa</em> e adicione o produto <strong>WhatsApp</strong> (a Meta libera um número oficial gratuito na hora).
-                  </li>
-                  <li>
-                    No painel lateral do AI Studio, abra <strong>Settings &gt; Secrets</strong> e adicione as variáveis do seu número:
-                    <div className="mt-1.5 grid grid-cols-1 sm:grid-cols-2 gap-1.5 font-mono text-[11px]">
-                      <div className="px-2 py-1 bg-slate-50 border border-slate-200 rounded flex items-center justify-between">
-                        <span>WHATSAPP_ACCESS_TOKEN</span>
-                        <span className={waStatus?.hasAccessToken ? 'text-emerald-700 font-bold' : 'text-slate-400'}>
-                          {waStatus?.hasAccessToken ? 'OK' : 'Pendente'}
-                        </span>
-                      </div>
-                      <div className="px-2 py-1 bg-slate-50 border border-slate-200 rounded flex items-center justify-between">
-                        <span>WHATSAPP_PHONE_NUMBER_ID</span>
-                        <span className={waStatus?.hasPhoneNumberId ? 'text-emerald-700 font-bold' : 'text-slate-400'}>
-                          {waStatus?.hasPhoneNumberId ? 'OK' : 'Pendente'}
-                        </span>
-                      </div>
-                      <div className="px-2 py-1 bg-slate-50 border border-slate-200 rounded flex items-center justify-between">
-                        <span>WHATSAPP_VERIFY_TOKEN</span>
-                        <span className={waStatus?.hasVerifyToken ? 'text-emerald-700 font-bold' : 'text-slate-400'}>
-                          {waStatus?.hasVerifyToken ? 'OK' : 'Pendente'}
-                        </span>
-                      </div>
-                      <div className="px-2 py-1 bg-slate-50 border border-slate-200 rounded flex items-center justify-between">
-                        <span>WHATSAPP_ALLOWED_PHONES</span>
-                        <span className={waStatus?.hasAllowedPhones ? 'text-emerald-700 font-bold' : 'text-slate-400'}>
-                          {waStatus?.hasAllowedPhones ? 'Ativo' : 'Opcional'}
-                        </span>
-                      </div>
+                {showTokenEditor && (
+                  <div className="px-4 pb-4 pt-2 border-t border-slate-100 space-y-2.5">
+                    <input
+                      ref={tokenInputRef}
+                      type="password"
+                      value={newTokenInput}
+                      onChange={(e) => setNewTokenInput(e.target.value)}
+                      placeholder="Novo Token da Meta (EAA...) — opcional se for apenas testar"
+                      className="w-full px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg"
+                    />
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                      <input
+                        type="text"
+                        value={testPhoneInput}
+                        onChange={(e) => setTestPhoneInput(e.target.value)}
+                        placeholder="5543996040935"
+                        className="flex-1 px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg"
+                      />
+                      <button
+                        type="button"
+                        disabled={isSendingTest}
+                        onClick={() => void handleSendTestWhatsApp()}
+                        className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-300 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 shrink-0"
+                      >
+                        {isSendingTest ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Enviando...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Send className="w-3.5 h-3.5" />
+                            <span>{newTokenInput.trim() ? 'Salvar Token e Testar' : 'Enviar Teste'}</span>
+                          </>
+                        )}
+                      </button>
                     </div>
-                  </li>
-                  <li>
-                    No painel da Meta (<strong>WhatsApp &gt; Configuração &gt; Webhook</strong>), cole a URL acima, informe o mesmo <code>WHATSAPP_VERIFY_TOKEN</code> e marque o campo <strong>messages</strong>.
-                  </li>
-                  <li>
-                    Pronto! Basta mandar foto/PDF de qualquer comprovante PIX ou mensagem para esse número no WhatsApp que ele responde confirmando e lança direto na planilha da família.
-                  </li>
-                </ol>
+                    {testResultMsg && (
+                      <div
+                        className={`p-2.5 rounded-lg border text-xs ${
+                          testResultMsg.ok
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                            : 'bg-red-50 border-red-200 text-red-800'
+                        }`}
+                      >
+                        {testResultMsg.text}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           )}

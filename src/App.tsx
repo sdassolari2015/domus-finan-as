@@ -7,15 +7,12 @@ import React, { useState, useEffect, useMemo } from 'react';
 import {
   ArrowRightCircle,
   Download,
-  RotateCcw,
   Plus,
   Calendar,
   Laptop,
   WifiOff,
-  Cloud,
   RefreshCw,
   LogOut,
-  Sparkles,
   MessageSquare,
   ShieldCheck,
 } from 'lucide-react';
@@ -1038,10 +1035,10 @@ export default function App() {
         ))}
       </div>
 
-      {/* Workspace Context & Month Toolbar + Real-Time Cloud Sync Status */}
-      <div className="bg-white border-b border-slate-200 px-4 sm:px-6 lg:px-8 py-3.5">
-        <div className="w-full flex flex-col xl:flex-row xl:items-center justify-between gap-4">
-          <div className="flex flex-wrap items-center gap-3">
+      {/* Workspace Context & Month Toolbar */}
+      <div className="bg-white border-b border-slate-200 px-4 sm:px-6 lg:px-8 py-3">
+        <div className="w-full flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-slate-100 border border-slate-200 rounded-lg">
               <Calendar className="w-4 h-4 text-slate-600" />
               <select
@@ -1062,7 +1059,7 @@ export default function App() {
               type="button"
               onClick={handleGenerateNextMonth}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors whitespace-nowrap shrink-0 shadow-2xs"
-              title="Avança um mês atualizando os números das parcelas (ex: 13/47 → 14/47) e removendo parcelas finalizadas (ex: 09/09)"
+              title="Avança um mês atualizando parcelas automaticamente"
             >
               <ArrowRightCircle className="w-4 h-4" />
               Gerar Próximo Mês
@@ -1072,7 +1069,7 @@ export default function App() {
               type="button"
               onClick={() => setWhatsAppModalOpen(true)}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-emerald-950 bg-emerald-100 hover:bg-emerald-200 border border-emerald-300 rounded-lg transition-colors whitespace-nowrap shrink-0 shadow-2xs"
-              title="Enviar comprovante PIX ou mensagem no estilo WhatsApp para lançar automaticamente no local exato"
+              title="Lançar comprovante PIX, áudio ou mensagem"
             >
               <MessageSquare className="w-4 h-4 text-emerald-800" />
               <span>PIX / WhatsApp</span>
@@ -1082,35 +1079,6 @@ export default function App() {
                 </span>
               )}
             </button>
-
-            <div className="flex items-center gap-1.5 text-xs text-slate-600 pl-1">
-              <Cloud
-                className={`w-3.5 h-3.5 shrink-0 ${
-                  cloudStatus === 'synced'
-                    ? 'text-emerald-700'
-                    : cloudStatus === 'saving'
-                    ? 'text-blue-600'
-                    : cloudStatus === 'error'
-                    ? 'text-amber-600'
-                    : 'text-slate-400'
-                }`}
-              />
-              <span className="font-medium text-slate-800">
-                Acesso: {loggedUser.name}
-              </span>
-              <span aria-hidden="true">·</span>
-              <span className="text-slate-500 truncate max-w-[230px]" title={lastCloudAction}>
-                {lastCloudAction}
-              </span>
-              {formattedLastTime && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span className="font-mono tabular-nums text-slate-500">
-                    {formattedLastTime}
-                  </span>
-                </>
-              )}
-            </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -1118,7 +1086,7 @@ export default function App() {
               type="button"
               onClick={() => setAccessModalOpen(true)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-slate-900 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg transition-colors whitespace-nowrap"
-              title="Gerenciar contas Google autorizadas e aprovar solicitações de acesso"
+              title="Gerenciar contas Google autorizadas"
             >
               <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
               <span>Permissões</span>
@@ -1130,32 +1098,12 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => setVersionModalOpen(true)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-emerald-900 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap"
-              title="Ver novidades desta versão e atualizar sem precisar reinstalar"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-emerald-700" />
-              v{CURRENT_APP_VERSION} · Atualizações
-            </button>
-            <button
-              type="button"
-              onClick={handleManualCloudRefresh}
-              disabled={isRefreshingCloud}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg transition-colors whitespace-nowrap"
-              title="Buscar imediatamente os lançamentos mais atuais salvos na nuvem"
-            >
-              <RefreshCw
-                className={`w-3.5 h-3.5 ${isRefreshingCloud ? 'animate-spin text-emerald-700' : ''}`}
-              />
-              Atualizar da Nuvem
-            </button>
-            <button
-              type="button"
               onClick={() => setInstallModalOpen(true)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shadow-2xs"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shadow-2xs"
+              title="Instalar aplicativo, copiar link oficial e gerenciar backups"
             >
               <Laptop className="w-3.5 h-3.5" />
-              Instalação (PC / iPhone)
+              Instalar App
             </button>
             <button
               type="button"
@@ -1167,18 +1115,31 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={handleRestoreInitialData}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
-              title="Restaurar dados originais da planilha de Outubro de 2026"
+              onClick={handleManualCloudRefresh}
+              disabled={isRefreshingCloud}
+              className="inline-flex items-center justify-center p-1.5 text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg transition-colors"
+              title={`Atualizar da nuvem (${lastCloudAction}${formattedLastTime ? ` · ${formattedLastTime}` : ''})`}
+              aria-label="Atualizar da nuvem"
             >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Restaurar
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${
+                  isRefreshingCloud
+                    ? 'animate-spin text-emerald-700'
+                    : cloudStatus === 'synced'
+                    ? 'text-emerald-700'
+                    : cloudStatus === 'saving'
+                    ? 'text-blue-600'
+                    : cloudStatus === 'error'
+                    ? 'text-amber-600'
+                    : 'text-slate-500'
+                }`}
+              />
             </button>
             <button
               type="button"
               onClick={handleLogout}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 border border-red-200 rounded-lg transition-colors whitespace-nowrap"
-              title="Sair da conta Google e voltar à tela de login"
+              title="Sair da conta Google"
             >
               <LogOut className="w-3.5 h-3.5" />
               Sair
@@ -1270,11 +1231,20 @@ export default function App() {
       {/* Quiet Footer */}
       <footer className="border-t border-slate-200 bg-white px-4 sm:px-6 lg:px-8 py-3.5 mt-8">
         <div className="w-full flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <span>
-            Domus Finanças · Logado como {loggedUser.name} · Sincronizado na Nuvem
-          </span>
+          <div className="flex items-center gap-2">
+            <span>Domus Finanças · {loggedUser.name}</span>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => setVersionModalOpen(true)}
+              className="font-mono text-slate-500 hover:text-emerald-700 underline-offset-2 hover:underline transition-colors"
+              title="Ver notas da versão"
+            >
+              v{CURRENT_APP_VERSION}
+            </button>
+          </div>
           <span className="font-mono tabular-nums">
-            Referência ativa: {currentLedger.label} · {currentLedger.expenses.length} contas ·{' '}
+            {currentLedger.label} · {currentLedger.expenses.length} contas ·{' '}
             {currentLedger.incomes.length} entradas
           </span>
         </div>
@@ -1319,6 +1289,7 @@ export default function App() {
         isInstallable={isInstallable}
         isInstalled={isInstalled}
         onTriggerPWAInstall={triggerPWAInstall}
+        onRestoreInitialData={handleRestoreInitialData}
         onShowToast={showToast}
       />
 

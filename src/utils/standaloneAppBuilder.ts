@@ -1157,7 +1157,7 @@ export function buildWindowsInstallerBat(ledgers: MonthLedger[]): string {
     '  sc.IconLocation = icoFile & ",0"',
     '  sc.WorkingDirectory = appDir',
     '  sc.WindowStyle = 3',
-    '  sc.Description = "Domus Financas - Aplicativo Independente (100% Desvinculado do AI Studio)"',
+    '  sc.Description = "Domus Financas - Aplicativo Oficial"',
     '  sc.Save',
     'End Sub',
     '',
@@ -1190,20 +1190,14 @@ export function buildWindowsInstallerBat(ledgers: MonthLedger[]): string {
   ].join('\r\n');
   const vbsB64 = utf8ToBase64(vbsScript);
 
-  const originUrl =
-    typeof window !== 'undefined' &&
-    window.location.origin.startsWith('http') &&
-    !window.location.origin.includes('localhost') &&
-    !window.location.origin.includes('127.0.0.1')
-      ? window.location.origin
-      : PERMANENT_APP_LINK;
+  const originUrl = PERMANENT_APP_LINK;
 
   const lines = [
     '@echo off',
     'chcp 65001 >nul',
-    'title Instalador Domus Financas v2.8.0 - 100% Independente do AI Studio',
+    'title Instalador Domus Financas v3.0.0',
     'echo ====================================================================',
-    'echo   INSTALANDO DOMUS FINANCAS v2.8.0 (DESVINCULADO DO AI STUDIO)',
+    'echo   INSTALANDO DOMUS FINANCAS v3.0.0',
     'echo ====================================================================',
     'echo.',
     'echo [1/4] Preparando pasta local em %LOCALAPPDATA%\\DomusFinanceiro...',
@@ -1258,7 +1252,7 @@ export function buildWindowsInstallerBat(ledgers: MonthLedger[]): string {
     ')',
     'del "%CS_FILE%" >nul 2>&1',
     '',
-    'echo [4/4] Removendo atalhos antigos do AI Studio e criando novo atalho independente...',
+    'echo [4/4] Atualizando atalhos na Area de Trabalho e Menu Iniciar...',
     ...toBatchBase64Chunks(vbsB64, 'VBS_B64_FILE'),
     'certutil -f -decode "%VBS_B64_FILE%" "%VBS_FILE%" >nul 2>&1',
     'del "%VBS_B64_FILE%" >nul 2>&1',

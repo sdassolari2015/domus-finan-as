@@ -5,19 +5,28 @@ export interface AppReleaseNote {
   changes: string[];
 }
 
-export const CURRENT_APP_VERSION = '2.9.9';
+export const CURRENT_APP_VERSION = '3.0.0';
 export const PERMANENT_APP_LINK = 'https://domus-finan-as.vercel.app';
-export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.9';
+export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v3.0.0';
 
 export const APP_RELEASES: AppReleaseNote[] = [
   {
-    version: '2.9.9',
+    version: '3.0.0',
     releaseDate: 'Versão Atual',
+    title: 'Visual Mais Limpo, Conexão WhatsApp Simplificada & Link Oficial GitHub/Vercel',
+    changes: [
+      'Conexão WhatsApp Simplificada: Removidas caixas duplicadas de QR Code, tutoriais antigos da Meta, URL de Webhook e botões de configuração já concluídos — mantendo apenas status direto e troca rápida de token recolhida.',
+      'Link Oficial Definitivo: A tela de Instalação e o instalador para PC agora apontam sempre para o link oficial publicado via GitHub/Vercel (domus-finan-as.vercel.app).',
+      'Barra Superior Mais Limpa: Removido excesso de textos e botões secundários no topo do aplicativo para uma navegação mais direta e organizada.',
+    ],
+  },
+  {
+    version: '2.9.9',
+    releaseDate: 'Versão Anterior',
     title: 'Login Obrigatório com Conta Google & Controle de Permissões Aprovadas',
     changes: [
-      'Acesso Exclusivo com Conta Google: Removida a entrada aberta sem login. Agora apenas contas Google cadastradas e aprovadas pelo administrador (sdassolari2015@gmail.com) conseguem entrar e visualizar a planilha.',
-      'Bloqueio Automático + Solicitação de Acesso: Qualquer conta Google não autorizada é bloqueada imediatamente e pode clicar em "Solicitar Permissão" para aparecer na aba Permissões do administrador aprovar ou recusar com 1 clique.',
-      'Gerenciador de Permissões em Tempo Real: Cadastre e aprove novos e-mails Google (como o da Viviane) ou revogue acessos a qualquer momento no botão "Permissões" no topo do app.',
+      'Acesso Exclusivo com Conta Google: Apenas contas Google cadastradas e aprovadas pelo administrador conseguem entrar e visualizar a planilha.',
+      'Gerenciador de Permissões em Tempo Real: Aprove solicitações ou cadastre novos e-mails no botão Permissões.',
     ],
   },
   {
@@ -71,7 +80,7 @@ export async function checkRemoteVersionJson(): Promise<AppReleaseNote | null> {
 }
 
 // Ensures the full production React bundle (/standalone/index.html, /standalone/app.js, /standalone/app.css)
-// is cached in browser Cache Storage and /sw.js is registered so the link opens even when AI Studio is closed.
+// is cached in browser Cache Storage and /sw.js is registered for fast offline fallback.
 export async function ensureStandaloneOfflineCache(): Promise<boolean> {
   try {
     if ('serviceWorker' in navigator) {
