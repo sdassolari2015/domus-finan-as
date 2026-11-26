@@ -1,10 +1,10 @@
 {
-  "version": "2.9.8",
+  "version": "2.9.9",
   "releaseDate": "Versão Atual",
-  "title": "Áudio no WhatsApp, PIX vs. Cartão de Crédito, Comprovantes Santander, Pendentes e Parceladas",
+  "title": "Login Obrigatório com Conta Google & Controle de Permissões Aprovadas",
   "changes": [
-    "Comprovantes Compridos (Santander) & Fixa vs. Gasto Avulso: Lê o comprovante completo do topo ao rodapé e só dá baixa em conta fixa quando empresa e valor batem (PIX para COPEL vai para Gastos Mensais sem baixar Fit Energia).",
-    "PIX vs. Cartão de Crédito: PIX do Sicredi, Santander, Bradesco ou Nubank nunca vai para Cartão de Crédito — só entra em Cartão quando aparecer explicitamente compra crédito / cartão / fatura.",
-    "Contas Pendentes, Parceladas (ex: 6x de 120) e Reconhecimento de Áudios de Voz no WhatsApp + Reações ✅/❌ e guia de Token Permanente da Meta."
+    "Acesso Exclusivo com Conta Google: Apenas contas Google cadastradas e aprovadas pelo administrador conseguem entrar e visualizar a planilha.",
+    "Bloqueio Automático + Solicitação de Acesso: Contas não aprovadas são bloqueadas na hora e podem solicitar aprovação para o administrador liberar ou recusar com 1 clique.",
+    "Gerenciador de Permissões em Tempo Real: Cadastre e aprove novos e-mails Google ou revogue acessos a qualquer momento no botão Permissões no topo do app."
   ]
 }

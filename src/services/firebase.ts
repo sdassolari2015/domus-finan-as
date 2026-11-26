@@ -33,7 +33,29 @@ export const auth = getAuth(app);
 
 export const HOUSEHOLD_ID = 'domus_family';
 export const VERSION_DOC_KEY = '2099-12';
+export const ACCESS_CONTROL_DOC_KEY = '2099-09';
+export const PRIMARY_ADMIN_EMAIL = 'sdassolari2015@gmail.com';
 export const SHARED_PRODUCTION_URL = PERMANENT_APP_LINK;
+
+export interface AuthorizedGoogleUser {
+  id: string;
+  email: string;
+  memberProfile: 'Rodolfo' | 'Viviane' | 'Família';
+  isAdmin: boolean;
+  addedAt: string;
+}
+
+export interface PendingAccessRequest {
+  id: string;
+  email: string;
+  displayName: string;
+  requestedAt: string;
+}
+
+export interface AccessControlState {
+  authorizedUsers: AuthorizedGoogleUser[];
+  pendingRequests: PendingAccessRequest[];
+}
 
 export enum OperationType {
   CREATE = 'create',
@@ -89,6 +111,7 @@ export function handleFirestoreError(
 
 export async function signInWithGooglePopup(): Promise<User> {
   const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
   const result = await signInWithPopup(auth, provider);
   return result.user;
 }
@@ -452,4 +475,259 @@ export function subscribeToCloudAppVersion(
   );
   return unsub;
 }
+
+// ==================== GOOGLE ACCOUNT ACCESS CONTROL (WHITELIST + REQUESTS) ====================
+
+export function normalizeEmail(email: string | null | undefined): string {
+  return String(email || '').trim().toLowerCase();
+}
+
+function getDefaultPrimaryAdmin(): AuthorizedGoogleUser {
+  return {
+    id: 'auth-primary-admin',
+    email: PRIMARY_ADMIN_EMAIL,
+    memberProfile: 'Rodolfo',
+    isAdmin: true,
+    addedAt: '2026-10-01',
+  };
+}
+
+function parseAccessControlDoc(data: Record<string, unknown> | undefined): AccessControlState {
+  const rawIncomes = Array.isArray(data?.incomes) ? data.incomes : [];
+  const rawExpenses = Array.isArray(data?.expenses) ? data.expenses : [];
+
+  const userMap = new Map<string, AuthorizedGoogleUser>();
+  // Primary owner admin is always guaranteed access and cannot be locked out
+  userMap.set(PRIMARY_ADMIN_EMAIL, getDefaultPrimaryAdmin());
+
+  for (const inc of rawIncomes as Array<Record<string, unknown>>) {
+    const email = normalizeEmail(String(inc?.description || ''));
+    if (!email || !email.includes('@')) continue;
+    const rawPerson = String(inc?.person || 'Família');
+    const memberProfile: 'Rodolfo' | 'Viviane' | 'Família' =
+      rawPerson === 'Rodolfo' || rawPerson === 'Viviane' ? rawPerson : 'Família';
+    const isPrimary = email === PRIMARY_ADMIN_EMAIL;
+    userMap.set(email, {
+      id: String(inc?.id || `auth-${email}`),
+      email,
+      memberProfile: isPrimary ? 'Rodolfo' : memberProfile,
+      isAdmin: isPrimary || Number(inc?.amount) === 1,
+      addedAt: String(inc?.date || new Date().toISOString().slice(0, 10)).slice(0, 16),
+    });
+  }
+
+  const reqMap = new Map<string, PendingAccessRequest>();
+  for (const exp of rawExpenses as Array<Record<string, unknown>>) {
+    const email = normalizeEmail(String(exp?.description || ''));
+    if (!email || !email.includes('@')) continue;
+    if (userMap.has(email)) continue; // Already approved
+    reqMap.set(email, {
+      id: String(exp?.id || `req-${email}`),
+      email,
+      displayName: String(exp?.notes || email.split('@')[0]).slice(0, 80),
+      requestedAt: String(exp?.dueDate || new Date().toISOString().slice(0, 10)).slice(0, 16),
+    });
+  }
+
+  return {
+    authorizedUsers: Array.from(userMap.values()),
+    pendingRequests: Array.from(reqMap.values()),
+  };
+}
+
+async function persistAccessControlState(state: AccessControlState): Promise<void> {
+  const accessRef = doc(db, 'households', HOUSEHOLD_ID, 'ledgers', ACCESS_CONTROL_DOC_KEY);
+  const path = `households/${HOUSEHOLD_ID}/ledgers/${ACCESS_CONTROL_DOC_KEY}`;
+
+  // Always preserve primary admin
+  const dedupedUsers = new Map<string, AuthorizedGoogleUser>();
+  dedupedUsers.set(PRIMARY_ADMIN_EMAIL, getDefaultPrimaryAdmin());
+  for (const u of state.authorizedUsers) {
+    const email = normalizeEmail(u.email);
+    if (!email || !email.includes('@')) continue;
+    const isPrimary = email === PRIMARY_ADMIN_EMAIL;
+    dedupedUsers.set(email, {
+      id: String(u.id || `auth-${Date.now()}`).slice(0, 64),
+      email,
+      memberProfile: isPrimary ? 'Rodolfo' : u.memberProfile,
+      isAdmin: isPrimary ? true : Boolean(u.isAdmin),
+      addedAt: String(u.addedAt || new Date().toISOString().slice(0, 10)).slice(0, 16),
+    });
+  }
+
+  const finalUsers = Array.from(dedupedUsers.values()).slice(0, 100);
+  const finalRequests = state.pendingRequests
+    .filter((r) => {
+      const em = normalizeEmail(r.email);
+      return em && em.includes('@') && !dedupedUsers.has(em);
+    })
+    .slice(0, 100);
+
+  try {
+    await setDoc(accessRef, {
+      householdId: HOUSEHOLD_ID,
+      monthKey: ACCESS_CONTROL_DOC_KEY,
+      label: 'Controle de Acesso Google',
+      year: 2099,
+      month: 9,
+      incomes: finalUsers.map((u) => ({
+        id: u.id,
+        person: u.memberProfile,
+        description: u.email.slice(0, 120),
+        amount: u.isAdmin ? 1 : 0,
+        date: u.addedAt,
+      })),
+      expenses: finalRequests.map((r) => ({
+        id: r.id.slice(0, 64),
+        description: normalizeEmail(r.email).slice(0, 120),
+        dueDate: r.requestedAt.slice(0, 16),
+        currentInstallment: null,
+        totalInstallments: null,
+        amount: 0,
+        status: 'Pendente',
+        blockId: 'outras',
+        category: 'Outros & Jurídico',
+        isRecurringFixed: false,
+        notes: String(r.displayName || '').slice(0, 120),
+      })),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function fetchAccessControlState(): Promise<AccessControlState> {
+  const accessRef = doc(db, 'households', HOUSEHOLD_ID, 'ledgers', ACCESS_CONTROL_DOC_KEY);
+  try {
+    let snap;
+    try {
+      snap = await getDocFromServer(accessRef);
+    } catch {
+      snap = await getDoc(accessRef);
+    }
+    if (!snap.exists()) {
+      const initial: AccessControlState = {
+        authorizedUsers: [getDefaultPrimaryAdmin()],
+        pendingRequests: [],
+      };
+      await persistAccessControlState(initial).catch(() => {});
+      return initial;
+    }
+    return parseAccessControlDoc(snap.data() as Record<string, unknown>);
+  } catch {
+    return {
+      authorizedUsers: [getDefaultPrimaryAdmin()],
+      pendingRequests: [],
+    };
+  }
+}
+
+export function subscribeToAccessControl(
+  onUpdate: (state: AccessControlState) => void
+): () => void {
+  const accessRef = doc(db, 'households', HOUSEHOLD_ID, 'ledgers', ACCESS_CONTROL_DOC_KEY);
+  return onSnapshot(
+    accessRef,
+    (snap) => {
+      if (!snap.exists()) {
+        const initial: AccessControlState = {
+          authorizedUsers: [getDefaultPrimaryAdmin()],
+          pendingRequests: [],
+        };
+        onUpdate(initial);
+        void persistAccessControlState(initial).catch(() => {});
+        return;
+      }
+      onUpdate(parseAccessControlDoc(snap.data() as Record<string, unknown>));
+    },
+    () => {
+      // Fallback to primary admin only on listener error
+      onUpdate({
+        authorizedUsers: [getDefaultPrimaryAdmin()],
+        pendingRequests: [],
+      });
+    }
+  );
+}
+
+export async function approveOrAddAuthorizedGoogleUser(params: {
+  email: string;
+  memberProfile: 'Rodolfo' | 'Viviane' | 'Família';
+  isAdmin: boolean;
+}): Promise<AccessControlState> {
+  const normalized = normalizeEmail(params.email);
+  if (!normalized || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+    throw new Error('Informe um endereço de e-mail Google válido.');
+  }
+  const current = await fetchAccessControlState();
+  const nextUsers = current.authorizedUsers.filter((u) => normalizeEmail(u.email) !== normalized);
+  nextUsers.push({
+    id: `auth-${Date.now()}`,
+    email: normalized,
+    memberProfile: normalized === PRIMARY_ADMIN_EMAIL ? 'Rodolfo' : params.memberProfile,
+    isAdmin: normalized === PRIMARY_ADMIN_EMAIL ? true : params.isAdmin,
+    addedAt: new Date().toISOString().slice(0, 10),
+  });
+  const nextRequests = current.pendingRequests.filter((r) => normalizeEmail(r.email) !== normalized);
+  const nextState: AccessControlState = {
+    authorizedUsers: nextUsers,
+    pendingRequests: nextRequests,
+  };
+  await persistAccessControlState(nextState);
+  return nextState;
+}
+
+export async function revokeAuthorizedGoogleUser(email: string): Promise<AccessControlState> {
+  const normalized = normalizeEmail(email);
+  if (normalized === PRIMARY_ADMIN_EMAIL) {
+    throw new Error('A conta do administrador principal não pode ser removida.');
+  }
+  const current = await fetchAccessControlState();
+  const nextState: AccessControlState = {
+    authorizedUsers: current.authorizedUsers.filter((u) => normalizeEmail(u.email) !== normalized),
+    pendingRequests: current.pendingRequests,
+  };
+  await persistAccessControlState(nextState);
+  return nextState;
+}
+
+export async function submitGoogleAccessRequest(params: {
+  email: string;
+  displayName: string;
+}): Promise<AccessControlState> {
+  const normalized = normalizeEmail(params.email);
+  if (!normalized || !normalized.includes('@')) {
+    throw new Error('E-mail Google inválido.');
+  }
+  const current = await fetchAccessControlState();
+  if (current.authorizedUsers.some((u) => normalizeEmail(u.email) === normalized)) {
+    return current;
+  }
+  const nextRequests = current.pendingRequests.filter((r) => normalizeEmail(r.email) !== normalized);
+  nextRequests.unshift({
+    id: `req-${Date.now()}`,
+    email: normalized,
+    displayName: String(params.displayName || normalized.split('@')[0]).slice(0, 80),
+    requestedAt: new Date().toISOString().slice(0, 10),
+  });
+  const nextState: AccessControlState = {
+    authorizedUsers: current.authorizedUsers,
+    pendingRequests: nextRequests,
+  };
+  await persistAccessControlState(nextState);
+  return nextState;
+}
+
+export async function rejectGoogleAccessRequest(email: string): Promise<AccessControlState> {
+  const normalized = normalizeEmail(email);
+  const current = await fetchAccessControlState();
+  const nextState: AccessControlState = {
+    authorizedUsers: current.authorizedUsers,
+    pendingRequests: current.pendingRequests.filter((r) => normalizeEmail(r.email) !== normalized),
+  };
+  await persistAccessControlState(nextState);
+  return nextState;
+}
+
 

@@ -17,6 +17,7 @@ import {
   LogOut,
   Sparkles,
   MessageSquare,
+  ShieldCheck,
 } from 'lucide-react';
 import {
   AccountBlockId,
@@ -43,8 +44,13 @@ import { BoletosPixTab } from './components/BoletosPixTab';
 import { ReportsTab } from './components/ReportsTab';
 import { TransactionModal } from './components/TransactionModal';
 import { InstallNotebookModal } from './components/InstallNotebookModal';
-import { LoginScreen, LoggedUserSession } from './components/LoginScreen';
+import {
+  LoginScreen,
+  LoggedUserSession,
+  UnauthorizedGoogleUser,
+} from './components/LoginScreen';
 import { AppUpdateBannerModal } from './components/AppUpdateBannerModal';
+import { AccessControlModal } from './components/AccessControlModal';
 import {
   WhatsAppPixModal,
   ParsedReceiptPayload,
@@ -53,6 +59,14 @@ import {
 import { CURRENT_APP_VERSION } from './data/appVersion';
 import { usePWAInstall, useOnlineStatus } from './hooks/usePWAInstall';
 import {
+  auth,
+  onAuthStateChanged,
+  User as FirebaseAuthUser,
+  AccessControlState,
+  PRIMARY_ADMIN_EMAIL,
+  normalizeEmail,
+  fetchAccessControlState,
+  subscribeToAccessControl,
   testFirestoreConnection,
   subscribeToHouseholdCloud,
   saveHouseholdStateToCloud,
@@ -66,7 +80,24 @@ const STORAGE_KEY = 'domus_household_ledgers_v1';
 const ACTIVE_MONTH_STORAGE_KEY = 'domus_active_month_v1';
 
 export default function App() {
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseAuthUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [accessControlLoaded, setAccessControlLoaded] = useState(false);
+  const [accessControl, setAccessControl] = useState<AccessControlState>({
+    authorizedUsers: [
+      {
+        id: 'auth-primary-admin',
+        email: PRIMARY_ADMIN_EMAIL,
+        memberProfile: 'Rodolfo',
+        isAdmin: true,
+        addedAt: '2026-10-01',
+      },
+    ],
+    pendingRequests: [],
+  });
   const [loggedUser, setLoggedUser] = useState<LoggedUserSession | null>(null);
+  const [unauthorizedUser, setUnauthorizedUser] = useState<UnauthorizedGoogleUser | null>(null);
+  const [accessModalOpen, setAccessModalOpen] = useState(false);
 
   const [ledgers, setLedgers] = useState<MonthLedger[]>(() => {
     try {
@@ -126,25 +157,103 @@ export default function App() {
   // Toast feedback
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    window.setTimeout(() => {
+      setToastMessage((prev) => (prev === msg ? null : prev));
+    }, 4500);
+  };
+
   useEffect(() => {
+    if (!loggedUser) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(ledgers));
     } catch {
       // Ignore storage quota errors
     }
-  }, [ledgers]);
+  }, [ledgers, loggedUser]);
 
   useEffect(() => {
+    if (!loggedUser) return;
     try {
       localStorage.setItem(ACTIVE_MONTH_STORAGE_KEY, activeMonthKey);
     } catch {
       // Ignore
     }
-  }, [activeMonthKey]);
+  }, [activeMonthKey, loggedUser]);
 
-  // Real-time Cloud Sync Subscription on Mount
+  // 1. Track Firebase Google Authentication state
   useEffect(() => {
     void testFirestoreConnection();
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      setFirebaseUser(user);
+      setAuthReady(true);
+    });
+    return () => unsubAuth();
+  }, []);
+
+  // 2. Real-time subscription to Approved Google Accounts & Pending Requests
+  useEffect(() => {
+    const unsubAccess = subscribeToAccessControl((state) => {
+      setAccessControl(state);
+      setAccessControlLoaded(true);
+    });
+    return () => unsubAccess();
+  }, []);
+
+  // 3. Enforce strict whitelist gating whenever auth user or approved list changes
+  useEffect(() => {
+    if (!authReady || !accessControlLoaded) return;
+
+    if (!firebaseUser || !firebaseUser.email) {
+      setLoggedUser(null);
+      setUnauthorizedUser(null);
+      return;
+    }
+
+    const emailNorm = normalizeEmail(firebaseUser.email);
+    const approvedEntry = accessControl.authorizedUsers.find(
+      (u) => normalizeEmail(u.email) === emailNorm
+    );
+
+    if (!approvedEntry) {
+      // Strictly block any unapproved Google account (including live revocation)
+      setLoggedUser(null);
+      setUnauthorizedUser({
+        email: emailNorm,
+        displayName: firebaseUser.displayName || emailNorm.split('@')[0],
+        photoURL: firebaseUser.photoURL,
+      });
+      return;
+    }
+
+    setUnauthorizedUser(null);
+    setLoggedUser((prev) => {
+      if (
+        prev &&
+        prev.email === approvedEntry.email &&
+        prev.role === approvedEntry.memberProfile &&
+        prev.isAdmin === approvedEntry.isAdmin
+      ) {
+        return prev;
+      }
+      return {
+        name: approvedEntry.memberProfile,
+        role: approvedEntry.memberProfile,
+        email: approvedEntry.email,
+        photoURL: firebaseUser.photoURL,
+        isAdmin: approvedEntry.isAdmin,
+        loginTime: new Date().toLocaleTimeString('pt-BR', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      };
+    });
+  }, [authReady, accessControlLoaded, firebaseUser, accessControl]);
+
+  // 4. Real-time Cloud Financial Sync — ONLY active after authenticated & approved Google login
+  useEffect(() => {
+    if (!loggedUser) return;
 
     const unsubscribe = subscribeToHouseholdCloud(
       (cloudLedgers) => {
@@ -169,17 +278,31 @@ export default function App() {
     return () => {
       unsubscribe();
     };
-  }, []);
+  }, [loggedUser?.email]);
 
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    window.setTimeout(() => {
-      setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 4500);
-  };
+  // Triggered right after Google popup sign-in to verify freshly from server
+  const handleGoogleAuthCompleted = async () => {
+    const freshAccess = await fetchAccessControlState();
+    setAccessControl(freshAccess);
+    setAccessControlLoaded(true);
 
-  // Handler executed when user logs in from LoginScreen: pulls latest server state
-  const handleLoginAndPullLatest = async (session: LoggedUserSession) => {
+    const current = auth.currentUser;
+    if (!current || !current.email) return;
+
+    const emailNorm = normalizeEmail(current.email);
+    const approvedEntry = freshAccess.authorizedUsers.find(
+      (u) => normalizeEmail(u.email) === emailNorm
+    );
+    if (!approvedEntry) {
+      setLoggedUser(null);
+      setUnauthorizedUser({
+        email: emailNorm,
+        displayName: current.displayName || emailNorm.split('@')[0],
+        photoURL: current.photoURL,
+      });
+      return;
+    }
+
     setCloudStatus('connecting');
     try {
       const latestSnapshot = await fetchLatestHouseholdStateFromServer();
@@ -188,16 +311,11 @@ export default function App() {
       setLastCloudAction(latestSnapshot.workspace.lastAction);
       setLastCloudTime(latestSnapshot.workspace.updatedAt || new Date());
       setCloudStatus('synced');
-      setLoggedUser(session);
       showToast(
-        `Login realizado como ${session.name}! Dados atualizados com o último lançamento salvo na nuvem.`
+        `Login Google aprovado (${approvedEntry.memberProfile})! Planilha sincronizada com a nuvem.`
       );
     } catch {
       setCloudStatus('error');
-      setLoggedUser(session);
-      showToast(
-        `Login realizado como ${session.name}. Exibindo dados locais sincronizados.`
-      );
     }
   };
 
@@ -224,6 +342,8 @@ export default function App() {
   const handleLogout = async () => {
     await signOutFirebase();
     setLoggedUser(null);
+    setUnauthorizedUser(null);
+    setAccessModalOpen(false);
   };
 
   const currentLedger = useMemo(() => {
@@ -772,14 +892,21 @@ export default function App() {
       })
     : null;
 
-  // Render LoginScreen before entering the workspace
-  if (!loggedUser) {
+  // Render strict Google LoginScreen before entering the workspace
+  if (!authReady || !accessControlLoaded || !loggedUser) {
+    const hasPendingRequest = Boolean(
+      unauthorizedUser &&
+        accessControl.pendingRequests.some(
+          (r) => normalizeEmail(r.email) === normalizeEmail(unauthorizedUser.email)
+        )
+    );
     return (
       <LoginScreen
-        onLoginSuccess={handleLoginAndPullLatest}
-        ledgers={ledgers}
-        lastCloudAction={lastCloudAction}
-        lastCloudTime={lastCloudTime}
+        isCheckingSession={!authReady || !accessControlLoaded}
+        unauthorizedUser={unauthorizedUser}
+        hasPendingRequestForUnauthorized={hasPendingRequest}
+        onGoogleAuthCompleted={handleGoogleAuthCompleted}
+        onSwitchGoogleAccount={handleLogout}
       />
     );
   }
@@ -989,6 +1116,20 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
+              onClick={() => setAccessModalOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-slate-900 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg transition-colors whitespace-nowrap"
+              title="Gerenciar contas Google autorizadas e aprovar solicitações de acesso"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
+              <span>Permissões</span>
+              {accessControl.pendingRequests.length > 0 && (
+                <span className="ml-0.5 px-1.5 py-0.5 text-[10px] font-mono font-bold bg-amber-500 text-slate-950 rounded">
+                  {accessControl.pendingRequests.length}
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
               onClick={() => setVersionModalOpen(true)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-emerald-900 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap"
               title="Ver novidades desta versão e atualizar sem precisar reinstalar"
@@ -1037,7 +1178,7 @@ export default function App() {
               type="button"
               onClick={handleLogout}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 border border-red-200 rounded-lg transition-colors whitespace-nowrap"
-              title="Voltar à tela de login e recarregar sessão"
+              title="Sair da conta Google e voltar à tela de login"
             >
               <LogOut className="w-3.5 h-3.5" />
               Sair
@@ -1191,6 +1332,16 @@ export default function App() {
         onApplyParsedTransaction={handleApplyParsedTransaction}
         onAcknowledgeWhatsAppItem={handleAcknowledgeWhatsAppItem}
         onNavigateToDestination={handleNavigateToParsedDestination}
+        onShowToast={showToast}
+      />
+
+      {/* Modal for Managing Authorized Google Accounts & Approving Access Requests */}
+      <AccessControlModal
+        isOpen={accessModalOpen}
+        onClose={() => setAccessModalOpen(false)}
+        accessControl={accessControl}
+        currentUserEmail={loggedUser.email}
+        isCurrentUserAdmin={loggedUser.isAdmin}
         onShowToast={showToast}
       />
     </div>

@@ -5,19 +5,19 @@ export interface AppReleaseNote {
   changes: string[];
 }
 
-export const CURRENT_APP_VERSION = '2.9.8';
+export const CURRENT_APP_VERSION = '2.9.9';
 export const PERMANENT_APP_LINK = 'https://domus-finan-as.vercel.app';
-export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.8';
+export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.9';
 
 export const APP_RELEASES: AppReleaseNote[] = [
   {
-    version: '2.9.8',
+    version: '2.9.9',
     releaseDate: 'Versão Atual',
-    title: 'Áudio no WhatsApp, PIX vs. Cartão de Crédito, Comprovantes Compridos (Santander), Contas Pendentes e Parceladas',
+    title: 'Login Obrigatório com Conta Google & Controle de Permissões Aprovadas',
     changes: [
-      'Comprovantes Compridos (Santander) & Conta Fixa vs. Gasto Avulso: Lê o comprovante inteiro do topo ao rodapé. Se for PIX para uma fixa cadastrada (ex: Fit Energia), dá baixa automática; se for outro destinatário/valor (ex: COPEL / COPELDIS com legenda "Luz"), lança corretamente em Gastos Mensais sem baixar a Fit Energia.',
-      'Diferenciação Rigorosa PIX vs. Cartão de Crédito: Comprovantes de PIX (mesmo do Sicredi, Santander, Bradesco ou Nubank) vão sempre para Boletos e Fixas — só lança em Cartão de Crédito quando aparecer explicitamente compra no crédito/cartão/fatura.',
-      'Contas Pendentes, Parceladas e Áudios no WhatsApp: Reconhece mensagens e áudios de voz (ex: "Pendente boleto 250 vence dia 20", "Compra crédito Nubank 6x de 120"), reações com emoji (✅/❌/⏳) e alerta de renovação de Token Permanente da Meta.',
+      'Acesso Exclusivo com Conta Google: Removida a entrada aberta sem login. Agora apenas contas Google cadastradas e aprovadas pelo administrador (sdassolari2015@gmail.com) conseguem entrar e visualizar a planilha.',
+      'Bloqueio Automático + Solicitação de Acesso: Qualquer conta Google não autorizada é bloqueada imediatamente e pode clicar em "Solicitar Permissão" para aparecer na aba Permissões do administrador aprovar ou recusar com 1 clique.',
+      'Gerenciador de Permissões em Tempo Real: Cadastre e aprove novos e-mails Google (como o da Viviane) ou revogue acessos a qualquer momento no botão "Permissões" no topo do app.',
     ],
   },
   {
