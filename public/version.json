@@ -1,10 +1,10 @@
 {
-  "version": "2.9.7",
+  "version": "2.9.8",
   "releaseDate": "Versão Atual",
-  "title": "Leitura Ultra-Rápida de Comprovantes PNG/PDF & Baixa Automática por Sinônimos",
+  "title": "Áudio no WhatsApp, PIX vs. Cartão de Crédito, Comprovantes Santander, Pendentes e Parceladas",
   "changes": [
-    "Leitura Ultra-Rápida de Imagens e PDFs (~1,5s): Desativado o atraso de pensamento dinâmico (thinkingBudget: 0) para reconhecer comprovantes PNG, JPG e PDFs bancários na mesma hora.",
-    "Reconhecimento de Prints Cortados e Sinônimos: Se o print estiver sem o topo do valor mas você escrever o nome da conta na legenda (ex: \"Luz\" -> Fit Energia R$ 309,74; \"Água\" -> Samae; \"Internet\" -> Help Telecon), o sistema identifica a conta na planilha e dá baixa automática.",
-    "Extração Direta de Texto de PDFs Bancários + Logo e Reações (✅ / ❌) no Contato do WhatsApp."
+    "Comprovantes Compridos (Santander) & Fixa vs. Gasto Avulso: Lê o comprovante completo do topo ao rodapé e só dá baixa em conta fixa quando empresa e valor batem (PIX para COPEL vai para Gastos Mensais sem baixar Fit Energia).",
+    "PIX vs. Cartão de Crédito: PIX do Sicredi, Santander, Bradesco ou Nubank nunca vai para Cartão de Crédito — só entra em Cartão quando aparecer explicitamente compra crédito / cartão / fatura.",
+    "Contas Pendentes, Parceladas (ex: 6x de 120) e Reconhecimento de Áudios de Voz no WhatsApp + Reações ✅/❌ e guia de Token Permanente da Meta."
   ]
 }

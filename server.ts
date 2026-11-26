@@ -10,6 +10,7 @@ import {
   ParserBlockOption,
   ParserExistingExpense,
 } from './server/receiptParser';
+import whatsappStatusHandler from './api/whatsapp/status';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +22,16 @@ const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/webp',
   'image/heic',
   'application/pdf',
+  'audio/ogg',
+  'audio/mpeg',
+  'audio/mp3',
+  'audio/mp4',
+  'audio/m4a',
+  'audio/x-m4a',
+  'audio/wav',
+  'audio/webm',
+  'audio/aac',
+  'audio/opus',
 ]);
 
 interface RequestWithRawBody extends Request {
@@ -203,10 +214,16 @@ async function startServer() {
         }
         if (imageMimeType === 'image/jpg') {
           imageMimeType = 'image/jpeg';
+        } else if (imageMimeType === 'audio/mp3') {
+          imageMimeType = 'audio/mpeg';
+        } else if (imageMimeType === 'audio/m4a' || imageMimeType === 'audio/x-m4a') {
+          imageMimeType = 'audio/mp4';
+        } else if (imageMimeType === 'audio/opus') {
+          imageMimeType = 'audio/ogg';
         }
         if (!ALLOWED_MEDIA_MIME_TYPES.has(imageMimeType)) {
           res.status(400).json({
-            error: 'Formato de arquivo não suportado. Use PNG, JPG, WEBP ou PDF.',
+            error: 'Formato de arquivo não suportado. Use PNG, JPG, WEBP, PDF ou Áudio.',
           });
           return;
         }
@@ -310,24 +327,106 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // 3. WhatsApp Cloud API Status (exposes ONLY booleans, never secrets)
-  app.get('/api/whatsapp/status', (_req: Request, res: Response) => {
-    const hasAccessToken = Boolean(process.env.WHATSAPP_ACCESS_TOKEN?.trim());
-    const hasPhoneNumberId = Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID?.trim());
-    const hasVerifyToken = true;
-    const hasAllowedPhones = Boolean(process.env.WHATSAPP_ALLOWED_PHONES?.trim());
-    const hasGeminiKey = Boolean(process.env.GEMINI_API_KEY?.trim());
+  // 3. WhatsApp Cloud API Status & Token Update (proxies to Vercel so encryption key matches the live webhook)
+  app.get('/api/whatsapp/status', async (_req: Request, res: Response) => {
+    try {
+      const upstream = await fetch('https://domus-finan-as.vercel.app/api/whatsapp/status', {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      const text = await upstream.text();
+      if (upstream.ok && text.trim().startsWith('{')) {
+        res.status(upstream.status).type('application/json').send(text);
+        return;
+      }
+    } catch {
+      // Fallback to local handler
+    }
+    try {
+      await whatsappStatusHandler(
+        { method: 'GET', body: {} },
+        { status: (code: number) => ({ json: (body: unknown) => res.status(code).json(body) }) }
+      );
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Erro ao consultar status do WhatsApp.',
+      });
+    }
+  });
 
-    res.json({
-      connected: hasAccessToken && hasPhoneNumberId,
-      hasAccessToken,
-      hasPhoneNumberId,
-      hasVerifyToken,
-      hasAllowedPhones,
-      hasGeminiKey,
-      pendingInboxCount: whatsappInboxQueue.length,
-      webhookPath: '/api/whatsapp/webhook',
-    });
+  app.post('/api/whatsapp/status', async (req: Request, res: Response) => {
+    const bodyObj = (req.body || {}) as Record<string, unknown>;
+    const cleanToken =
+      typeof bodyObj.newAccessToken === 'string'
+        ? bodyObj.newAccessToken.replace(/\s+/g, '').trim()
+        : '';
+
+    try {
+      const upstream = await fetch('https://domus-finan-as.vercel.app/api/whatsapp/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          ...bodyObj,
+          newAccessToken: cleanToken || undefined,
+        }),
+      });
+      const text = await upstream.text();
+      if (text.trim().startsWith('{')) {
+        const parsed = JSON.parse(text) as Record<string, unknown>;
+        // If user submitted a new token, verify immediately via GET status so the UI confirms clearly
+        if (cleanToken.length > 20) {
+          try {
+            const checkRes = await fetch('https://domus-finan-as.vercel.app/api/whatsapp/status', {
+              method: 'GET',
+              headers: { Accept: 'application/json' },
+            });
+            const checkJson = (await checkRes.json().catch(() => ({}))) as {
+              metaTokenValid?: boolean;
+              metaError?: string;
+            };
+            if (checkJson.metaTokenValid === true) {
+              res.status(200).json({
+                ...parsed,
+                ok: true,
+                tokenSaved: true,
+                metaTokenValid: true,
+                deliveredAny: Boolean(parsed.ok),
+              });
+              return;
+            }
+            if (checkJson.metaTokenValid === false && checkJson.metaError) {
+              res.status(200).json({
+                ...parsed,
+                ok: false,
+                tokenSaved: false,
+                metaTokenValid: false,
+                error: checkJson.metaError,
+              });
+              return;
+            }
+          } catch {
+            // Return upstream response as-is
+          }
+        }
+        res.status(upstream.status).json(parsed);
+        return;
+      }
+    } catch {
+      // Fallback to local handler
+    }
+
+    try {
+      await whatsappStatusHandler(
+        { method: 'POST', body: { ...bodyObj, newAccessToken: cleanToken || undefined } },
+        { status: (code: number) => ({ json: (body: unknown) => res.status(code).json(body) }) }
+      );
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Erro ao salvar token do WhatsApp.',
+      });
+    }
   });
 
   // 4. WhatsApp Inbox Polling & Acknowledgment
@@ -437,10 +536,17 @@ async function startServer() {
                 mediaBase64 = media.base64;
                 mediaMimeType = media.mimeType;
               }
+            } else if (msgType === 'audio') {
+              const mediaId = String(msg?.audio?.id || '');
+              const media = await downloadWhatsAppMediaAsBase64(mediaId);
+              if (media) {
+                mediaBase64 = media.base64;
+                mediaMimeType = media.mimeType;
+              }
             } else {
               await sendWhatsAppTextReply(
                 fromPhone,
-                'Domus Finanças: Envie uma foto/PDF do comprovante PIX ou uma mensagem de texto (ex: "Paguei 120 mercado" ou "Recebi 500 extra").'
+                'Domus Finanças: Envie uma foto/PDF do comprovante PIX, um áudio ou uma mensagem de texto (ex: "Paguei 120 mercado" ou "Pendente boleto 250 vence dia 20").'
               );
               continue;
             }

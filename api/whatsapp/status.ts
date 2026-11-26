@@ -261,7 +261,7 @@ export default async function handler(
 ) {
   const overrideToken =
     typeof req.body?.newAccessToken === 'string'
-      ? req.body.newAccessToken.trim()
+      ? req.body.newAccessToken.replace(/\s+/g, '').trim()
       : undefined;
 
   const { token, diagExpenses } = await getEffectiveAccessToken(overrideToken);
@@ -286,8 +286,46 @@ export default async function handler(
       });
     }
 
+    let tokenSaved = false;
+    let tokenCheckValid = false;
+    let tokenCheckError: string | null = null;
+    let tokenPhoneDisplay: string | null = null;
+
     if (overrideToken && overrideToken.length > 20) {
-      await saveEncryptedTokenToCloud(overrideToken, diagExpenses);
+      // Verify token with Meta first before saving
+      try {
+        const verifyRes = await fetch(
+          `https://graph.facebook.com/v21.0/${phoneNumberId}?fields=display_phone_number,verified_name`,
+          { headers: { Authorization: `Bearer ${overrideToken}` } }
+        );
+        const verifyJson = (await verifyRes.json().catch(() => ({}))) as {
+          display_phone_number?: string;
+          error?: { message?: string };
+        };
+        if (verifyRes.ok) {
+          tokenCheckValid = true;
+          tokenPhoneDisplay = verifyJson.display_phone_number || null;
+          await saveEncryptedTokenToCloud(overrideToken, diagExpenses);
+          tokenSaved = true;
+        } else {
+          tokenCheckValid = false;
+          tokenCheckError =
+            verifyJson?.error?.message || `A Meta rejeitou o token (HTTP ${verifyRes.status}).`;
+          return res.status(200).json({
+            ok: false,
+            tokenSaved: false,
+            metaTokenValid: false,
+            error: tokenCheckError,
+          });
+        }
+      } catch (err) {
+        return res.status(200).json({
+          ok: false,
+          tokenSaved: false,
+          metaTokenValid: false,
+          error: err instanceof Error ? err.message : 'Erro ao validar o token na Meta.',
+        });
+      }
     }
 
     const wabaId =
@@ -413,7 +451,12 @@ export default async function handler(
     }
 
     return res.status(200).json({
-      ok: deliveredAny,
+      ok: deliveredAny || tokenSaved,
+      deliveredAny,
+      tokenSaved,
+      metaTokenValid: tokenSaved ? tokenCheckValid : undefined,
+      metaPhoneDisplay: tokenPhoneDisplay,
+      metaError: tokenCheckError,
       profileSync,
       candidates,
       attempts,

@@ -5,19 +5,19 @@ export interface AppReleaseNote {
   changes: string[];
 }
 
-export const CURRENT_APP_VERSION = '2.9.7';
+export const CURRENT_APP_VERSION = '2.9.8';
 export const PERMANENT_APP_LINK = 'https://domus-finan-as.vercel.app';
-export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.7';
+export const STANDALONE_CACHE_NAME = 'domus-standalone-cache-v2.9.8';
 
 export const APP_RELEASES: AppReleaseNote[] = [
   {
-    version: '2.9.7',
+    version: '2.9.8',
     releaseDate: 'Versão Atual',
-    title: 'Leitura Ultra-Rápida de Comprovantes PNG/PDF & Baixa Automática por Sinônimos ("Luz", "Água", "Internet")',
+    title: 'Áudio no WhatsApp, PIX vs. Cartão de Crédito, Comprovantes Compridos (Santander), Contas Pendentes e Parceladas',
     changes: [
-      'Leitura Ultra-Rápida de Imagens e PDFs (~1,5s): Desativado o atraso de pensamento dinâmico (thinkingBudget: 0) e retentativas longas na Vercel para reconhecer comprovantes PNG, JPG e PDFs bancários (Sicredi, Santander, Bradesco, Nubank) na mesma hora.',
-      'Reconhecimento de Prints Cortados e Sinônimos: Se o print estiver sem o topo do valor mas você escrever o nome da conta na legenda (ex: "Luz" / "Copeldis" -> Fit Energia R$ 309,74; "Água" -> Samae; "Internet" -> Help Telecon), o sistema identifica a conta na planilha e dá baixa automática.',
-      'Extração Direta de Texto de PDFs Bancários + Logo e Reações (✅ / ❌) no Contato do WhatsApp.',
+      'Comprovantes Compridos (Santander) & Conta Fixa vs. Gasto Avulso: Lê o comprovante inteiro do topo ao rodapé. Se for PIX para uma fixa cadastrada (ex: Fit Energia), dá baixa automática; se for outro destinatário/valor (ex: COPEL / COPELDIS com legenda "Luz"), lança corretamente em Gastos Mensais sem baixar a Fit Energia.',
+      'Diferenciação Rigorosa PIX vs. Cartão de Crédito: Comprovantes de PIX (mesmo do Sicredi, Santander, Bradesco ou Nubank) vão sempre para Boletos e Fixas — só lança em Cartão de Crédito quando aparecer explicitamente compra no crédito/cartão/fatura.',
+      'Contas Pendentes, Parceladas e Áudios no WhatsApp: Reconhece mensagens e áudios de voz (ex: "Pendente boleto 250 vence dia 20", "Compra crédito Nubank 6x de 120"), reações com emoji (✅/❌/⏳) e alerta de renovação de Token Permanente da Meta.',
     ],
   },
   {

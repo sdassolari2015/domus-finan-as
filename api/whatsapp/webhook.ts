@@ -26,6 +26,16 @@ const ALLOWED_MEDIA_MIME_TYPES = new Set([
   'image/webp',
   'image/heic',
   'application/pdf',
+  'audio/ogg',
+  'audio/opus',
+  'audio/mpeg',
+  'audio/mp3',
+  'audio/mp4',
+  'audio/m4a',
+  'audio/aac',
+  'audio/wav',
+  'audio/webm',
+  'audio/amr',
 ]);
 
 const ALLOWED_CATEGORIES = [
@@ -74,11 +84,10 @@ const DEFAULT_BLOCKS: BlockItem[] = [
   { id: 'outras', shortName: 'Boletos e Fixas', fullTitle: 'Outras Despesas - Boletos e Fixas', group: 'boletos_pix' },
 ];
 
-// Fast models first with thinking disabled (thinkingBudget: 0) and 1 attempt per model (no 30s backoff delay)
+// Fast non-deprecated multimodal models (supports tall PNG/JPG, PDF, and OGG/MP3 audio natively)
 const MODEL_FALLBACK_CHAIN = [
   'gemini-2.5-flash-lite',
   'gemini-2.5-flash',
-  'gemini-2.0-flash',
   'gemini-3.1-flash-lite-preview',
   'gemini-3-flash-preview',
 ];
@@ -117,36 +126,68 @@ function isAllowedMetaMediaUrl(rawUrl: string): boolean {
 
 function detectMimeTypeFromMagicBytes(buf: Buffer, fallbackMime: string): string {
   if (buf.length >= 4) {
+    // PNG
     if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
       return 'image/png';
     }
+    // JPEG
     if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
       return 'image/jpeg';
     }
+    // PDF
     if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) {
       return 'application/pdf';
     }
+    // OGG (WhatsApp voice notes / PTT)
+    if (buf[0] === 0x4f && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53) {
+      return 'audio/ogg';
+    }
+    // MP3 (ID3 or MPEG frame sync)
+    if (
+      (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) ||
+      (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0)
+    ) {
+      return 'audio/mpeg';
+    }
+    // WEBM
+    if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) {
+      return 'audio/webm';
+    }
+    // RIFF -> WEBP or WAV
     if (
       buf.length >= 12 &&
       buf[0] === 0x52 &&
       buf[1] === 0x49 &&
       buf[2] === 0x46 &&
-      buf[3] === 0x46 &&
-      buf[8] === 0x57 &&
-      buf[9] === 0x45 &&
-      buf[10] === 0x42 &&
-      buf[11] === 0x50
+      buf[3] === 0x46
     ) {
-      return 'image/webp';
+      if (buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) {
+        return 'image/webp';
+      }
+      if (buf[8] === 0x57 && buf[9] === 0x41 && buf[10] === 0x56 && buf[11] === 0x45) {
+        return 'audio/wav';
+      }
+    }
+    // MP4 / M4A (ftyp)
+    if (
+      buf.length >= 8 &&
+      buf[4] === 0x66 &&
+      buf[5] === 0x74 &&
+      buf[6] === 0x79 &&
+      buf[7] === 0x70
+    ) {
+      return 'audio/mp4';
     }
   }
   const clean = (fallbackMime || 'image/png').toLowerCase().split(';')[0].trim();
   if (clean === 'image/jpg') return 'image/jpeg';
+  if (clean === 'audio/opus') return 'audio/ogg';
+  if (clean === 'audio/mp3') return 'audio/mpeg';
+  if (clean === 'audio/m4a') return 'audio/mp4';
   if (ALLOWED_MEDIA_MIME_TYPES.has(clean)) return clean;
   return 'image/png';
 }
 
-// Extracts readable strings directly from PDF buffers (including FlateDecode compressed streams)
 function extractTextFromPdfBuffer(buf: Buffer): string {
   try {
     const rawLatin = buf.toString('latin1');
@@ -280,7 +321,7 @@ async function recordWebhookDiagnostic(
     await setDoc(diagRef, {
       householdId: HOUSEHOLD_DOC_ID,
       monthKey: DIAGNOSTIC_DOC_KEY,
-      label: 'Diagnóstico Webhook WhatsApp', // Always <= 64 chars to satisfy firestore.rules
+      label: 'Diagnóstico Webhook WhatsApp',
       year: 2099,
       month: 11,
       incomes: prevIncomes.slice(0, 10),
@@ -297,46 +338,59 @@ async function sendWhatsAppReadAndReaction(params: {
   toPhone: string;
   messageId: string;
   emoji: string;
-}): Promise<void> {
+}): Promise<{ ok: boolean; status: number }> {
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || '1428542540347469';
-  if (!params.token || !phoneNumberId || !params.messageId) return;
+  if (!params.token || !phoneNumberId || !params.messageId) {
+    return { ok: false, status: 0 };
+  }
 
+  // 1. Mark message as read (2 blue ticks)
+  fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${params.token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      status: 'read',
+      message_id: params.messageId,
+    }),
+  }).catch(() => {});
+
+  // 2. React directly on user's message trying all Brazilian 13/12-digit candidates
   const candidates = getCandidateRecipientPhones(params.toPhone);
-  const primaryCandidate = candidates[0];
-
-  await Promise.all([
-    fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${params.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        status: 'read',
-        message_id: params.messageId,
-      }),
-    }).catch(() => {}),
-    primaryCandidate && /^[0-9]{8,20}$/.test(primaryCandidate)
-      ? fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${params.token}`,
-            'Content-Type': 'application/json',
+  let lastStatus = 0;
+  for (const candidate of candidates) {
+    if (!/^[0-9]{8,20}$/.test(candidate)) continue;
+    try {
+      const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${params.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: candidate,
+          type: 'reaction',
+          reaction: {
+            message_id: params.messageId,
+            emoji: params.emoji,
           },
-          body: JSON.stringify({
-            messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: primaryCandidate,
-            type: 'reaction',
-            reaction: {
-              message_id: params.messageId,
-              emoji: params.emoji,
-            },
-          }),
-        }).catch(() => {})
-      : Promise.resolve(),
-  ]);
+        }),
+      });
+      lastStatus = res.status;
+      if (res.ok) {
+        return { ok: true, status: res.status };
+      }
+      if (res.status === 401) break; // Expired token — no point retrying other format
+    } catch {
+      // Try next candidate
+    }
+  }
+  return { ok: false, status: lastStatus };
 }
 
 async function sendWhatsAppTextReply(
@@ -351,49 +405,49 @@ async function sendWhatsAppTextReply(
   }
 
   const candidates = getCandidateRecipientPhones(toPhone);
-  const primaryCandidate = candidates[0];
-  if (!primaryCandidate || !/^[0-9]{8,20}$/.test(primaryCandidate)) {
-    return { ok: false, details: 'Invalid phone' };
-  }
+  const logs: string[] = [];
 
-  try {
-    const payload: Record<string, unknown> = {
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: primaryCandidate,
-      type: 'text',
-      text: { body: bodyText.slice(0, 1000) },
-    };
-    if (replyToMessageId) {
-      payload.context = { message_id: replyToMessageId };
+  for (const candidate of candidates) {
+    if (!/^[0-9]{8,20}$/.test(candidate)) continue;
+    try {
+      const payload: Record<string, unknown> = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: candidate,
+        type: 'text',
+        text: { body: bodyText.slice(0, 1000) },
+      };
+      if (replyToMessageId) {
+        payload.context = { message_id: replyToMessageId };
+      }
+
+      const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const respText = await res.text();
+      logs.push(`${candidate}:${res.status}:${respText.slice(0, 75)}`);
+      if (res.ok) {
+        return { ok: true, details: logs.join(' || ') };
+      }
+      if (res.status === 401) break;
+    } catch (err) {
+      logs.push(`${candidate}:ERR:${err instanceof Error ? err.message : 'fetch'}`);
     }
-
-    const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-    const respText = await res.text();
-    return {
-      ok: res.ok,
-      details: `${primaryCandidate}:${res.status}:${respText.slice(0, 75)}`,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      details: `${primaryCandidate}:ERR:${err instanceof Error ? err.message : 'fetch'}`,
-    };
   }
+
+  return { ok: false, details: logs.join(' || ') };
 }
 
 async function downloadWhatsAppMediaAsBase64(
   token: string,
   mediaId: string
 ): Promise<{ base64: string; mimeType: string; pdfExtractedText?: string } | { error: string }> {
-  if (!token) return { error: 'Token ausente ao baixar mídia' };
+  if (!token) return { error: 'Token da Meta ausente — atualize o token no app' };
   const cleanId = mediaId.trim();
   if (!/^[a-zA-Z0-9_.:-]{3,256}$/.test(cleanId)) {
     return { error: `Media ID inválido: ${cleanId.slice(0, 30)}` };
@@ -407,6 +461,9 @@ async function downloadWhatsAppMediaAsBase64(
   });
   if (!metaRes.ok) {
     const errTxt = await metaRes.text().catch(() => '');
+    if (metaRes.status === 401) {
+      return { error: 'Token da Meta expirado (HTTP 401) — renove o token no app' };
+    }
     return { error: `Meta media lookup HTTP ${metaRes.status}: ${errTxt.slice(0, 80)}` };
   }
   const metaJson = (await metaRes.json()) as { url?: string; mime_type?: string };
@@ -479,7 +536,11 @@ function parseFlexibleAmount(val: unknown): number {
 function extractAmountFromText(rawText: string): number {
   const cleaned = rawText
     .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, ' ')
-    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, ' ');
+    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, ' ')
+    .replace(/\b\d{1,2}\s*(?:x|vezes|parcelas?)\b/gi, ' ')
+    .replace(/\bparcela\s*\d{1,2}\s*(?:de|\/)\s*\d{1,2}\b/gi, ' ')
+    .replace(/\bdia\s+\d{1,2}\b/gi, ' ')
+    .replace(/\bvenc(?:e|imento)\s*(?:dia\s*)?\d{1,2}\b/gi, ' ');
 
   const brlMatches = cleaned.match(
     /(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{1,2}|\d+,\d{1,2}|\d+\.\d{2}|\b\d+(?:\b|$))/gi
@@ -501,94 +562,146 @@ function extractAmountFromText(rawText: string): number {
   return 0;
 }
 
-// Finds a matching expense in the active ledger by direct name, synonym ("Luz" / "Copel" -> "Fit Energia", "Água" -> "Samae", "Internet" -> "Help Telecon"), or amount
-function findMatchingExistingExpense(
+function extractInstallmentsFromText(rawText: string): {
+  currentInstallment: number | null;
+  totalInstallments: number | null;
+  amountIsPerInstallment: boolean;
+} {
+  const norm = normalizeText(rawText);
+
+  // Pattern 1: "parcela 2 de 10", "2/10", "parcela 3/12"
+  const slashMatch = norm.match(/\b(?:parcela\s*)?(\d{1,2})\s*(?:\/|de)\s*(\d{1,2})\b/);
+  if (slashMatch) {
+    const curr = parseInt(slashMatch[1], 10);
+    const tot = parseInt(slashMatch[2], 10);
+    // Avoid mistaking dates like "25/11" for installments unless curr <= tot and tot >= 2 and tot <= 72 and curr <= 72
+    const looksLikeDate = /\b(?:dia|em|vence|vencimento|para)\s+\d{1,2}\/\d{1,2}\b/.test(norm);
+    if (!looksLikeDate && curr >= 1 && tot >= 2 && curr <= tot && tot <= 72) {
+      return {
+        currentInstallment: curr,
+        totalInstallments: tot,
+        amountIsPerInstallment: true,
+      };
+    }
+  }
+
+  // Pattern 2: "em 6x de 150", "6x de 150", "6 parcelas de 150", "parcelado em 5x", "5 vezes"
+  const timesMatch = norm.match(
+    /\b(?:em\s+|parcelad[oa]\s*(?:em\s*)?)?(\d{1,2})\s*(?:x|vezes|parcelas?)\b/
+  );
+  if (timesMatch) {
+    const tot = parseInt(timesMatch[1], 10);
+    if (tot >= 2 && tot <= 72) {
+      const hasPerInstallmentDe = /\b\d{1,2}\s*(?:x|vezes|parcelas?)\s+de\s+(?:r\$\s*)?\d/.test(norm);
+      return {
+        currentInstallment: 1,
+        totalInstallments: tot,
+        amountIsPerInstallment: hasPerInstallmentDe,
+      };
+    }
+  }
+
+  return { currentInstallment: null, totalInstallments: null, amountIsPerInstallment: true };
+}
+
+function extractDueDateFromText(rawText: string, activeMonthKey: string, todayIso: string): string {
+  const norm = normalizeText(rawText);
+  const [actYear, actMonth] = activeMonthKey.split('-');
+
+  // Full date DD/MM/YYYY or DD/MM
+  const dateMatch = norm.match(/\b(?:vence|vencimento|para|dia|em)\s*(?:dia\s*)?(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if (dateMatch) {
+    const dd = Math.min(31, Math.max(1, parseInt(dateMatch[1], 10)));
+    const mm = Math.min(12, Math.max(1, parseInt(dateMatch[2], 10)));
+    const yy = dateMatch[3]
+      ? dateMatch[3].length === 2
+        ? `20${dateMatch[3]}`
+        : dateMatch[3]
+      : actYear;
+    return `${yy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+  }
+
+  // Day of month: "vence dia 15", "para dia 20", "vencimento 10"
+  const dayMatch = norm.match(/\b(?:vence|vencimento|para\s+o?\s*dia|dia)\s+(\d{1,2})\b/);
+  if (dayMatch) {
+    const dd = Math.min(31, Math.max(1, parseInt(dayMatch[1], 10)));
+    return `${actYear}-${actMonth}-${String(dd).padStart(2, '0')}`;
+  }
+
+  return `${activeMonthKey}-${todayIso.slice(8, 10)}`;
+}
+
+// Strict helper: checks if text/receipt EXPLICITLY mentions a credit card purchase/invoice
+function hasExplicitCreditCardSignal(text: string): boolean {
+  const norm = normalizeText(text);
+  return /\b(compra\s+(?:no\s+)?credito|credito\s+a\s+vista|credito\s+parcelado|cartao\s+de\s+credito|no\s+cartao|cartao\s+(?:sicredi|nubank|bradesco|santander|caixa|quero)|no\s+credito|passei\s+no\s+(?:cartao|credito|nubank|sicredi|bradesco|santander)|fatura\s+(?:do\s+)?(?:cartao|nubank|sicredi|bradesco|santander)|mastercard|visa\b|elo\b|aproximacao\s+credito|quero\s*quero)\b/.test(
+    norm
+  );
+}
+
+// Strict helper: checks if text/receipt indicates PIX payment
+function hasPixPaymentSignal(text: string): boolean {
+  const norm = normalizeText(text);
+  return (
+    /\b(pix|chave\s+pix|transferencia\s+pix|comprovante\s+pix|qr\s*code\s+pix|pix\s+enviado|pix\s+recebido)\b/.test(
+      norm
+    ) || /\be\d{8}\d{12,}\b/i.test(text)
+  );
+}
+
+// ONLY match an existing pending fixed bill when the payee/description ACTUALLY matches AND the amount matches!
+// Never map COPEL / COPELDIS (a separate bill with a different amount) onto Fit Energia!
+function findStrictMatchingPendingExpense(
   searchText: string,
   extractedAmount: number,
   existingExpenses: ExistingExpenseItem[]
 ): ExistingExpenseItem | null {
   const norm = normalizeText(searchText);
-  if (!norm && extractedAmount <= 0) return null;
+  if (!norm) return null;
 
-  // Prefer pending expenses first, then any expense in the month
-  const ordered = [
-    ...existingExpenses.filter((e) => e.status === 'Pendente'),
-    ...existingExpenses.filter((e) => e.status !== 'Pendente'),
-  ];
-
-  // 1. Direct or word overlap match
-  for (const exp of ordered) {
+  const pendingList = existingExpenses.filter((e) => e.status === 'Pendente');
+  for (const exp of pendingList) {
     const expNorm = normalizeText(exp.description);
     const words = expNorm.split(/\s+/).filter((w) => w.length >= 3);
-    const nameMatches =
-      (expNorm.length >= 3 && norm.includes(expNorm)) ||
-      (words.length > 0 && words.every((w) => norm.includes(w)));
-    const amountMatches =
-      extractedAmount > 0 &&
-      exp.amount > 0 &&
-      Math.abs(exp.amount - extractedAmount) <= 1.5;
+    if (words.length === 0) continue;
 
-    if (nameMatches || (amountMatches && words.some((w) => norm.includes(w)))) {
-      return exp;
+    const fullNameMatch = expNorm.length >= 4 && norm.includes(expNorm);
+    const allWordsMatch = words.every((w) => norm.includes(w));
+    if (!fullNameMatch && !allWordsMatch) continue;
+
+    // If both the receipt/message AND the pending bill have amounts, verify they are compatible!
+    // If the amount is clearly different (e.g. R$ 85 vs R$ 309.74), treat it as a separate random monthly expense!
+    if (extractedAmount > 0 && exp.amount > 0) {
+      const tolerance = Math.max(15, exp.amount * 0.2);
+      if (Math.abs(exp.amount - extractedAmount) > tolerance) {
+        continue;
+      }
     }
-  }
 
-  // 2. Smart Brazilian household bill synonym matching (e.g. "Luz" / "Copeldis" -> "Fit Energia", "Água" -> "Samae", "Internet" -> "Help Telecon")
-  const synonymGroups: Array<{ trigger: RegExp; targetMatch: RegExp }> = [
-    {
-      trigger: /\b(luz|energia|copel|copeldis|eletricidade|celesc|energisa)\b/,
-      targetMatch: /\b(fit\s*energia|energia|luz|copel)\b/,
-    },
-    {
-      trigger: /\b(agua|samae|sanepar|sabesp)\b/,
-      targetMatch: /\b(samae|agua|sanepar)\b/,
-    },
-    {
-      trigger: /\b(internet|wifi|wi-fi|help|telecon|fibra)\b/,
-      targetMatch: /\b(help|telecon|internet)\b/,
-    },
-    {
-      trigger: /\b(casa|financiamento|fin\s*casa|prestacao\s*casa)\b/,
-      targetMatch: /\b(fin\.?\s*casa|financiamento|casa)\b/,
-    },
-    {
-      trigger: /\b(candeias|clube)\b/,
-      targetMatch: /\b(candeias)\b/,
-    },
-    {
-      trigger: /\b(lorenzo|reforco)\b/,
-      targetMatch: /\b(reforco|lorenzo)\b/,
-    },
-    {
-      trigger: /\b(funcional|crianca)\b/,
-      targetMatch: /\b(funcional)\b/,
-    },
-    {
-      trigger: /\b(virtus)\b/,
-      targetMatch: /\b(virtus)\b/,
-    },
-    {
-      trigger: /\b(start)\b/,
-      targetMatch: /\b(start)\b/,
-    },
-    {
-      trigger: /\b(aapomil)\b/,
-      targetMatch: /\b(aapomil)\b/,
-    },
-    {
-      trigger: /\b(tv|p2p|maluco|iptv)\b/,
-      targetMatch: /\b(tv|p2p|maluco)\b/,
-    },
-  ];
-
-  for (const grp of synonymGroups) {
-    if (grp.trigger.test(norm)) {
-      const found = ordered.find((e) => grp.targetMatch.test(normalizeText(e.description)));
-      if (found) return found;
-    }
+    return exp;
   }
 
   return null;
+}
+
+function cleanExpenseDescription(rawDesc: string, fallback: string): string {
+  let cleaned = String(rawDesc || '')
+    .replace(/^(pago|paguei|gastei|comprei|recebi|pendente|conta\s+pendente|conta\s+a\s+pagar|fiz\s+pix|pix\s+de|pix|lancamento|lançar)[,:\s-]+/i, '')
+    .replace(/(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{1,2}|\d+,\d{1,2}|\d+\.\d{2})/gi, '')
+    .replace(/\b(?:em\s+|parcelad[oa]\s*(?:em\s*)?)?\d{1,2}\s*(?:x|vezes|parcelas?)\b/gi, '')
+    .replace(/\b(?:parcela\s*)?\d{1,2}\s*(?:\/|de)\s*\d{1,2}\b/gi, '')
+    .replace(/\b(?:vence|vencimento|para\s+o?\s*dia)\s*(?:dia\s*)?\d{1,2}(?:\/\d{1,2})?\b/gi, '')
+    .replace(/\b(reais|hoje|via\s+pix|pendente|a\s+pagar|para\s+pagar)\b/gi, ' ')
+    .replace(/^[,.\-–:\s]+|[,.\-–:\s]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned || cleaned.length < 2) {
+    cleaned = fallback;
+  } else {
+    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+  }
+  return cleaned.slice(0, 75);
 }
 
 function parsePortugueseFinancialTextFallback(params: {
@@ -600,13 +713,15 @@ function parsePortugueseFinancialTextFallback(params: {
   defaultPerson: string;
 }) {
   const norm = normalizeText(params.text);
-  const extractedAmount = extractAmountFromText(params.text);
+  const extractedAmountRaw = extractAmountFromText(params.text);
+  const inst = extractInstallmentsFromText(params.text);
+  const dueDate = extractDueDateFromText(params.text, params.activeMonthKey, params.todayIso);
 
   const isIncome =
     /\b(recebi|recebido|entrada|salario|pro-labore|pro labore|ganhei|depilacao|azilo|freela|renda|deposito recebido|pix recebido)\b/.test(
       norm
     ) ||
-    (/\b(extra)\b/.test(norm) && !/\b(paguei|gastei|comprei|mercado)\b/.test(norm));
+    (/\b(extra)\b/.test(norm) && !/\b(paguei|gastei|comprei|mercado|pendente|boleto)\b/.test(norm));
 
   const transactionType: 'income' | 'expense' = isIncome ? 'income' : 'expense';
 
@@ -618,18 +733,32 @@ function parsePortugueseFinancialTextFallback(params: {
     person = 'Rodolfo';
   }
 
+  // Compute monthly installment value if user wrote "600 em 3x" (without "de")
+  let finalAmount = extractedAmountRaw;
+  if (
+    inst.totalInstallments &&
+    inst.totalInstallments >= 2 &&
+    !inst.amountIsPerInstallment &&
+    extractedAmountRaw > 0 &&
+    /\b(total|comprei|compra|gastei|parcelei|dividi)\b/.test(norm)
+  ) {
+    finalAmount = Math.round((extractedAmountRaw / inst.totalInstallments) * 100) / 100;
+  }
+
   const matchedExpense =
-    transactionType === 'expense'
-      ? findMatchingExistingExpense(params.text, extractedAmount, params.existingExpenses)
+    transactionType === 'expense' && !inst.totalInstallments
+      ? findStrictMatchingPendingExpense(params.text, finalAmount, params.existingExpenses)
       : null;
 
-  const action: 'create' | 'mark_existing_paid' =
-    matchedExpense && matchedExpense.status === 'Pendente'
-      ? 'mark_existing_paid'
-      : 'create';
+  const action: 'create' | 'mark_existing_paid' = matchedExpense
+    ? 'mark_existing_paid'
+    : 'create';
+
+  const isCreditCard = hasExplicitCreditCardSignal(params.text);
+  const isPix = hasPixPaymentSignal(params.text) && !isCreditCard;
 
   let blockId = matchedExpense ? matchedExpense.blockId : 'outras';
-  if (!matchedExpense) {
+  if (!matchedExpense && isCreditCard) {
     for (const blk of params.blocks) {
       if (blk.id === 'outras') continue;
       const blkNorm = normalizeText(blk.shortName);
@@ -644,11 +773,17 @@ function parsePortugueseFinancialTextFallback(params: {
     }
   }
 
-  let boletoSubType: 'fixa' | 'mensal' | 'variavel' = 'mensal';
+  const isPending =
+    /\b(pendente|a\s+pagar|para\s+pagar|pra\s+pagar|vence|vencimento|falta\s+pagar|agendad[oa]|nao\s+paguei|devo|boleto\s+para)\b/.test(
+      norm
+    ) ||
+    (Boolean(inst.totalInstallments) && !/\b(paguei|pago|quitado)\b/.test(norm));
+
+  let boletoSubType: 'fixa' | 'mensal' | 'variavel' = inst.totalInstallments ? 'variavel' : 'mensal';
   let category: string = matchedExpense ? matchedExpense.category : 'Outros & Jurídico';
 
   if (/\b(luz|energia|fit energia|agua|samae|sanepar|copel|copeldis|celesc)\b/.test(norm)) {
-    boletoSubType = 'fixa';
+    boletoSubType = matchedExpense ? 'fixa' : 'mensal';
     category = 'Utilidades (Luz & Água)';
   } else if (/\b(internet|telecon|help|tim|vivo|claro|celular|telefone|wi-fi)\b/.test(norm)) {
     boletoSubType = 'fixa';
@@ -659,14 +794,14 @@ function parsePortugueseFinancialTextFallback(params: {
   } else if (/\b(consorcio|virtus|start|patrimonio)\b/.test(norm)) {
     boletoSubType = 'variavel';
     category = 'Consórcios & Patrimônio';
-  } else if (/\b(candeias|clube|lazer|viagem|hotel|cinema|passeio)\b/.test(norm)) {
+  } else if (/\b(candeias|clube|lazer|viagem|hotel|cinema|passeio|lanche|pizza|restaurante)\b/.test(norm)) {
     boletoSubType = norm.includes('candeias') ? 'variavel' : 'mensal';
     category = 'Lazer & Clube';
   } else if (/\b(gasolina|combustivel|posto|etanol|diesel|oficina|pneu|carro|moto|uber|pedagio)\b/.test(norm)) {
-    boletoSubType = 'mensal';
+    boletoSubType = inst.totalInstallments ? 'variavel' : 'mensal';
     category = 'Transporte & Veículos';
   } else if (/\b(farmacia|remedio|medico|consulta|exame|dentista|saude|aapomil|hospital)\b/.test(norm)) {
-    boletoSubType = norm.includes('aapomil') ? 'fixa' : 'mensal';
+    boletoSubType = norm.includes('aapomil') ? 'fixa' : inst.totalInstallments ? 'variavel' : 'mensal';
     category = 'Associações & Saúde';
   } else if (/\b(tv|p2p|netflix|spotify|assinatura|amazon|youtube)\b/.test(norm)) {
     boletoSubType = 'fixa';
@@ -674,46 +809,44 @@ function parsePortugueseFinancialTextFallback(params: {
   } else if (/\b(aluguel|condominio|iptu|financiamento|casa|reforma)\b/.test(norm)) {
     boletoSubType = 'fixa';
     category = 'Moradia & Financiamento';
-  } else if (/\b(cartao|fatura|banco|juros|tarifa)\b/.test(norm) || blockId !== 'outras') {
+  } else if (blockId !== 'outras') {
     category = 'Financeiro & Cartões';
-  } else if (/\b(parcela|parcelado|boleto)\b/.test(norm)) {
+  }
+
+  if (inst.totalInstallments && blockId === 'outras') {
     boletoSubType = 'variavel';
   }
 
-  const finalAmount =
-    extractedAmount > 0
-      ? extractedAmount
+  const amount =
+    finalAmount > 0
+      ? finalAmount
       : matchedExpense && matchedExpense.amount > 0
       ? matchedExpense.amount
       : 0;
 
-  let cleanDesc = params.text
-    .replace(/^(paguei|gastei|comprei|recebi|fiz\s+pix|pix\s+de|pix|lancamento|lançar)\s+/i, '')
-    .replace(/(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{1,2}|\d+,\d{1,2}|\d+\.\d{2})/gi, '')
-    .replace(/\b(no|na|do|da|de|em|via|pix|hoje|reais)\b/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (matchedExpense) {
-    cleanDesc = matchedExpense.description;
-  } else if (!cleanDesc || cleanDesc.length < 2) {
-    cleanDesc = transactionType === 'income' ? `Entrada (${person})` : 'Pagamento via PIX';
-  } else {
-    cleanDesc = cleanDesc.charAt(0).toUpperCase() + cleanDesc.slice(1);
-  }
+  const description = matchedExpense
+    ? matchedExpense.description
+    : cleanExpenseDescription(
+        params.text,
+        transactionType === 'income' ? `Entrada (${person})` : 'Pagamento via PIX'
+      );
 
   return {
     transactionType,
     action,
+    paymentMethod: isCreditCard ? 'credit_card' : isPix ? 'pix' : isPending ? 'boleto' : 'pix',
     matchedExistingExpenseId: matchedExpense ? matchedExpense.id : '',
-    description: cleanDesc.slice(0, 75),
-    amount: finalAmount,
-    date: `${params.activeMonthKey}-${params.todayIso.slice(8, 10)}`,
-    status: /\b(pendente|vence|agendado|a pagar)\b/.test(norm) ? 'Pendente' : 'Pago',
+    description,
+    amount,
+    date: dueDate,
+    status: isPending ? 'Pendente' : 'Pago',
     blockId,
     boletoSubType,
     category,
+    currentInstallment: inst.currentInstallment || 0,
+    totalInstallments: inst.totalInstallments || 0,
     person,
+    transcript: '',
   };
 }
 
@@ -726,6 +859,32 @@ function extractJsonObject(rawText: string): string | null {
     return trimmed.slice(firstBrace, lastBrace + 1);
   }
   return null;
+}
+
+async function transcribeAudioFallback(
+  ai: GoogleGenAI,
+  audioBase64: string,
+  audioMimeType: string
+): Promise<string> {
+  const audioModels = ['gemini-3.5-transcribe', 'gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+  for (const modelName of audioModels) {
+    try {
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: audioMimeType, data: audioBase64 } },
+            { text: 'Transcreva fielmente este áudio em português do Brasil, preservando valores em reais, nomes, parcelas e datas.' },
+          ],
+        },
+      });
+      const text = (response.text ?? '').trim();
+      if (text) return text;
+    } catch {
+      // Try next audio model
+    }
+  }
+  return '';
 }
 
 async function generateWithFallback(
@@ -744,7 +903,6 @@ async function generateWithFallback(
         config: {
           systemInstruction,
           temperature: 0.1,
-          // CRITICAL: Disable dynamic thinking so Gemini Vision responds in ~1.5s instead of 28s!
           ...(isGemini25 ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
           responseMimeType: 'application/json',
           responseSchema: {
@@ -752,6 +910,7 @@ async function generateWithFallback(
             properties: {
               transactionType: { type: Type.STRING },
               action: { type: Type.STRING },
+              paymentMethod: { type: Type.STRING },
               matchedExistingExpenseId: { type: Type.STRING },
               description: { type: Type.STRING },
               amount: { type: Type.NUMBER },
@@ -760,11 +919,15 @@ async function generateWithFallback(
               blockId: { type: Type.STRING },
               boletoSubType: { type: Type.STRING },
               category: { type: Type.STRING },
+              currentInstallment: { type: Type.INTEGER },
+              totalInstallments: { type: Type.INTEGER },
               person: { type: Type.STRING },
+              transcript: { type: Type.STRING },
             },
             required: [
               'transactionType',
               'action',
+              'paymentMethod',
               'description',
               'amount',
               'date',
@@ -772,6 +935,8 @@ async function generateWithFallback(
               'blockId',
               'boletoSubType',
               'category',
+              'currentInstallment',
+              'totalInstallments',
               'person',
             ],
           },
@@ -790,10 +955,11 @@ async function generateWithFallback(
 
 async function parseAndSaveDirectToFirestore(params: {
   text?: string;
-  imageBase64?: string;
-  imageMimeType?: string;
+  mediaBase64?: string;
+  mediaMimeType?: string;
   pdfExtractedText?: string;
   documentFilename?: string;
+  isAudio?: boolean;
   senderName: string;
 }) {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -840,83 +1006,120 @@ async function parseAndSaveDirectToFirestore(params: {
 
   let raw: Record<string, unknown> | null = null;
   let geminiErrMsg = '';
+  let audioTranscript = '';
 
   const combinedTextContext = [
     params.text || '',
     params.documentFilename ? `Arquivo: ${params.documentFilename}` : '',
-    params.pdfExtractedText ? `Texto do PDF: ${params.pdfExtractedText}` : '',
+    params.pdfExtractedText ? `Texto extraído do PDF: ${params.pdfExtractedText}` : '',
   ]
     .filter(Boolean)
     .join(' | ');
 
   if (apiKey) {
     try {
-      // CRITICAL: retryOptions: { attempts: 1 } prevents 30s p-retry exponential backoff on rate-limited models!
       const ai = new GoogleGenAI({
         apiKey,
         apiVersion: 'v1beta',
         httpOptions: {
           apiVersion: 'v1beta',
-          timeout: 9000,
+          timeout: 12000,
           retryOptions: { attempts: 1 },
           headers: { 'User-Agent': 'aistudio-build' },
         },
       });
 
       const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
-      if (params.imageBase64 && params.imageMimeType) {
+      if (params.mediaBase64 && params.mediaMimeType) {
         parts.push({
           inlineData: {
-            mimeType: params.imageMimeType,
-            data: params.imageBase64,
+            mimeType: params.mediaMimeType,
+            data: params.mediaBase64,
           },
         });
       }
       parts.push({
         text: [
           `Data de hoje: ${todayIso}`,
-          `Mês ativo: ${activeMonthKey}`,
+          `Mês ativo na planilha: ${activeMonthKey}`,
           `Remetente: ${defaultPerson}`,
-          `Blocos disponíveis: ${JSON.stringify(blocks)}`,
-          `Contas existentes no mês (para baixa automática ou consulta de valor quando o print estiver cortado): ${JSON.stringify(
-            existingExpenses.map((e) => ({
-              id: e.id,
-              description: e.description,
-              amount: e.amount,
-              status: e.status,
-              blockId: e.blockId,
-              category: e.category,
-            }))
+          `Cartões e blocos disponíveis: ${JSON.stringify(blocks)}`,
+          `Contas PENDENTES já lançadas no mês (para baixa automática APENAS se o favorecido E o valor realmente baterem): ${JSON.stringify(
+            existingExpenses
+              .filter((e) => e.status === 'Pendente')
+              .map((e) => ({
+                id: e.id,
+                description: e.description,
+                amount: e.amount,
+                blockId: e.blockId,
+                category: e.category,
+              }))
           )}`,
-          combinedTextContext
-            ? `Legenda/Texto: "${combinedTextContext}"`
-            : 'Extraia o valor (R$), favorecido/descrição e data deste comprovante PIX ou boleto.',
+          params.isAudio
+            ? 'O usuário enviou um ÁUDIO de voz no WhatsApp. Ouça o áudio em português do Brasil, transcreva-o no campo "transcript" e extraia todos os dados do lançamento financeiro (valor, descrição, se é pago ou pendente, se é parcelado, se é PIX ou cartão de crédito, data de vencimento).'
+            : combinedTextContext
+            ? `Mensagem/Legenda/PDF: "${combinedTextContext}"`
+            : 'Leia o comprovante INTEIRO (do topo extremo ao rodapé extremo, pois comprovantes do Santander e outros bancos são bem compridos) e extraia valor (R$), favorecido, método de pagamento (PIX vs Cartão de Crédito), data e parcelas.',
         ].join('\n'),
       });
 
-      const systemInstruction = `Você é o classificador financeiro do Domus Finanças (Rodolfo e Viviane). Analise a imagem PNG/JPG ou PDF do comprovante PIX e/ou a legenda e extraia o lançamento exato.
-- transactionType: "income" (entrada/recebido) ou "expense" (saída/pago/transferido).
-- action: "mark_existing_paid" se corresponder a uma conta pendente existente na lista (informe o id em matchedExistingExpenseId), ou "create" se for um lançamento novo.
-- IMPORTANTE SOBRE PRINTS CORTADOS E SINÔNIMOS:
-  * Se o usuário escreveu "Luz" ou o comprovante mostra "COPEL" / "COPELDIS" / "ENERGIA", isso corresponde à conta de luz da família ("Fit Energia" na lista de contas existentes). Se a imagem estiver cortada sem mostrar o valor em R$, use o valor da conta correspondente na lista (ex: Fit Energia = 309.74) e marque action = "mark_existing_paid" com o id dela!
-  * O mesmo vale para "Água" / "Samae" -> "Samae"; "Internet" -> "Help Telecon"; "Casa" -> "Fin. Casa".
-- amount: valor numérico em reais (ex: 150.50). Procure por "Valor", "R$", "Total", "Valor pago" na imagem/PDF ou use o valor da conta existente correspondente.
-- description: se o usuário digitou o nome da despesa na legenda (ex: "Luz", "Lanche da noite", "Mercado"), use esse nome combinado com o favorecido (ou o nome da conta existente).
-- blockId: id do cartão/conta se mencionado (ex: nubank, bradesco, santander, caixa, sicredi, quero_quero), ou "outras" para PIX/boletos/gastos gerais.
-- boletoSubType: "fixa" (luz, água, internet, fixas mensais), "variavel" (parcelado, consórcio, boleto parcelado) ou "mensal" (mercado, farmácia, gasolina, lanche, PIX e gastos do mês).
-- Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`;
+      const systemInstruction = `Você é o classificador financeiro preciso do Domus Finanças (Rodolfo e Viviane).
 
-      const jsonText = await generateWithFallback(ai, parts, systemInstruction);
-      raw = JSON.parse(jsonText);
+REGRAS OBRIGATÓRIAS:
+1. COMPROVANTES COMPRIDOS (Santander, Sicredi, Bradesco, Nubank, Caixa, Itaú, Inter):
+   - Leia a imagem ou PDF INTEIRO do topo até o final. O valor (R$) geralmente fica na parte superior e o favorecido ("Para") e pagador ("De") mais abaixo. Extraia o VALOR EXATO impresso no comprovante!
+
+2. DIFERENCIAÇÃO RIGOROSA — PIX vs. CARTÃO DE CRÉDITO ("paymentMethod" e "blockId"):
+   - Se o comprovante for um PIX (ex: Comprovante PIX do Sicredi, PIX Santander, PIX Bradesco, PIX Nubank, PDF "sicredi_...pdf" contendo "Pix", "Chave Pix", "Transferência Pix", "ID/Transação E..."), defina paymentMethod = "pix" e OBRIGATORIAMENTE blockId = "outras" (NUNCA jogue um PIX para o cartão de crédito só porque o banco é Sicredi, Santander, Bradesco ou Nubank!).
+   - SÓ defina paymentMethod = "credit_card" e escolha um blockId de cartão (sicredi, nubank, bradesco, santander, quero_quero, caixa) se aparecer EXPLICITAMENTE no comprovante ou na mensagem/áudio que é uma COMPRA NO CARTÃO DE CRÉDITO (ex: "compra crédito", "crédito à vista", "crédito parcelado", "cartão de crédito", "Mastercard", "Visa", "Elo", "fatura", ou o usuário disser "no cartão Sicredi", "no crédito Nubank", "passei no cartão").
+   - Para boletos/carnês, use paymentMethod = "boleto" e blockId = "outras".
+
+3. BAIXA EM CONTA FIXA JÁ LANÇADA vs. NOVA CONTA ALEATÓRIA DO MÊS ("action"):
+   - Só defina action = "mark_existing_paid" e preencha matchedExistingExpenseId quando o pagamento for REALMENTE daquela conta fixa pendente já cadastrada (mesmo favorecido/empresa E valor compatível com o da conta pendente, ex: PIX para "Fit Energia" de R$ 309,74).
+   - Se for outra empresa/favorecido OU outro valor diferente (exemplo: comprovante PIX para "COPEL" / "COPELDIS" com outro valor, mesmo que o usuário escreva "Luz" na legenda), NÃO dê baixa em "Fit Energia"! Defina action = "create", matchedExistingExpenseId = "", blockId = "outras", boletoSubType = "mensal" (gasto aleatório do mês) e description = "Luz - COPELDIS".
+
+4. CONTAS PENDENTES E PARCELADAS ("status", "currentInstallment", "totalInstallments", "date"):
+   - status: "Pendente" quando a mensagem/áudio indicar conta a pagar, pendente, boleto a vencer, vencimento futuro ("pendente", "a pagar", "vence dia 15", "falta pagar") ou compra parcelada a pagar. Use "Pago" quando for comprovante já pago ou mensagem no passado ("paguei", "pago", "fiz pix").
+   - Parcelamento: se mencionar parcelas (ex: "em 5x de 120", "parcelado em 6 vezes", "parcela 2 de 10", "3/12"), preencha currentInstallment (ex: 1 ou 2) e totalInstallments (ex: 5, 6, 10, 12). Se não for parcelado, retorne 0 para ambos.
+   - Valor em parcelamento: se disser "em 5x de 120", amount = 120. Se disser "comprei 600 em 3x" (valor total dividido), calcule o valor da parcela mensal: amount = 200.
+   - Se for parcelado e NÃO for cartão de crédito (blockId = "outras"), use boletoSubType = "variavel".
+   - Data ("date" em YYYY-MM-DD): se mencionar vencimento (ex: "vence dia 15" ou "para dia 20/12"), use essa data exata; caso contrário use a data do comprovante ou hoje (${todayIso}).
+
+5. DESCRIÇÃO LIMPA ("description"):
+   - Retorne uma descrição curta, limpa e sem repetir palavras nem incluir o valor (ex: "Lanche da noite", "Pizza da noite", "Luz - COPELDIS", "Mercado Atacadão").
+   - Categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.`;
+
+      try {
+        const jsonText = await generateWithFallback(ai, parts, systemInstruction);
+        raw = JSON.parse(jsonText);
+        if (typeof raw?.transcript === 'string' && raw.transcript.trim()) {
+          audioTranscript = raw.transcript.trim();
+        }
+      } catch (primaryErr) {
+        geminiErrMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+        // If audio failed direct multimodal JSON, transcribe with gemini-3.5-transcribe and parse deterministically
+        if (params.isAudio && params.mediaBase64 && params.mediaMimeType) {
+          audioTranscript = await transcribeAudioFallback(
+            ai,
+            params.mediaBase64,
+            params.mediaMimeType
+          );
+        }
+      }
     } catch (err) {
       geminiErrMsg = err instanceof Error ? err.message : String(err);
       raw = null;
     }
   }
 
-  if (!raw && combinedTextContext) {
+  const fallbackTextSource = [params.text || '', audioTranscript, params.pdfExtractedText || '']
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+
+  if (!raw && fallbackTextSource) {
     raw = parsePortugueseFinancialTextFallback({
-      text: combinedTextContext,
+      text: fallbackTextSource,
       blocks,
       existingExpenses,
       activeMonthKey,
@@ -928,25 +1131,68 @@ async function parseAndSaveDirectToFirestore(params: {
   if (!raw) {
     throw new Error(
       geminiErrMsg
-        ? `Falha ao ler comprovante (${geminiErrMsg.slice(0, 90)})`
-        : 'Não foi possível identificar os dados do comprovante'
+        ? `Falha ao ler ${params.isAudio ? 'áudio' : 'comprovante'} (${geminiErrMsg.slice(0, 90)})`
+        : 'Não foi possível identificar os dados do lançamento'
     );
   }
 
   const transactionType = raw.transactionType === 'income' ? 'income' : 'expense';
-
-  // Check if Gemini matched an existing expense OR if our synonym matcher finds a match for caption/description
-  let matchedExpense: ExistingExpenseItem | null =
-    transactionType === 'expense' && raw.matchedExistingExpenseId
-      ? existingExpenses.find((e) => e.id === raw.matchedExistingExpenseId) || null
-      : null;
-
   const parsedAmt = parseFlexibleAmount(raw.amount);
 
-  if (!matchedExpense && transactionType === 'expense') {
-    const searchStr = `${params.text || ''} ${String(raw.description || '')} ${params.pdfExtractedText || ''}`.trim();
-    matchedExpense = findMatchingExistingExpense(
-      searchStr,
+  // Extract & validate installments from Gemini + deterministic text/transcript check
+  const textInstallments = extractInstallmentsFromText(fallbackTextSource);
+  const rawCurrInst = Number(raw.currentInstallment);
+  const rawTotInst = Number(raw.totalInstallments);
+  let currentInstallment: number | null =
+    Number.isInteger(rawCurrInst) &&
+    Number.isInteger(rawTotInst) &&
+    rawCurrInst >= 1 &&
+    rawTotInst >= 2 &&
+    rawCurrInst <= rawTotInst
+      ? rawCurrInst
+      : textInstallments.currentInstallment;
+  let totalInstallments: number | null =
+    Number.isInteger(rawCurrInst) &&
+    Number.isInteger(rawTotInst) &&
+    rawCurrInst >= 1 &&
+    rawTotInst >= 2 &&
+    rawCurrInst <= rawTotInst
+      ? rawTotInst
+      : textInstallments.totalInstallments;
+
+  // Verify existing pending expense match STRICTLY (never hijack Fit Energia for COPELDIS or mismatched amount!)
+  let matchedExpense: ExistingExpenseItem | null =
+    transactionType === 'expense' && raw.matchedExistingExpenseId
+      ? existingExpenses.find(
+          (e) => e.id === raw.matchedExistingExpenseId && e.status === 'Pendente'
+        ) || null
+      : null;
+
+  if (matchedExpense) {
+    const receiptDescNorm = normalizeText(
+      `${String(raw.description || '')} ${params.text || ''} ${params.pdfExtractedText || ''}`
+    );
+    const expNorm = normalizeText(matchedExpense.description);
+
+    // Guard 1: If receipt says COPEL / COPELDIS and matched bill is Fit Energia, reject false match!
+    if (/\bcopel/.test(receiptDescNorm) && !/\bcopel/.test(expNorm)) {
+      matchedExpense = null;
+    }
+    // Guard 2: If both have amounts and they differ significantly (> 20% and > R$ 15), reject false match!
+    if (
+      matchedExpense &&
+      parsedAmt > 0 &&
+      matchedExpense.amount > 0 &&
+      Math.abs(matchedExpense.amount - parsedAmt) > Math.max(15, matchedExpense.amount * 0.2)
+    ) {
+      matchedExpense = null;
+    }
+  }
+
+  if (!matchedExpense && transactionType === 'expense' && !totalInstallments) {
+    const strictSearch = `${String(raw.description || '')} ${fallbackTextSource}`.trim();
+    matchedExpense = findStrictMatchingPendingExpense(
+      strictSearch,
       parsedAmt,
       existingExpenses
     );
@@ -957,16 +1203,57 @@ async function parseAndSaveDirectToFirestore(params: {
       ? 'mark_existing_paid'
       : 'create';
 
+  // STRICT PIX vs. CREDIT CARD GUARD:
+  // A PIX transfer from Sicredi / Santander / Bradesco / Nubank MUST NEVER go into a Credit Card block!
+  const allCombinedText = `${fallbackTextSource} ${String(raw.description || '')}`.trim();
+  const explicitCreditCard =
+    raw.paymentMethod === 'credit_card' || hasExplicitCreditCardSignal(allCombinedText);
+  const detectedPix =
+    raw.paymentMethod === 'pix' ||
+    (hasPixPaymentSignal(allCombinedText) && !hasExplicitCreditCardSignal(allCombinedText));
+
   const validBlockIds = new Set(blocks.map((b) => b.id));
-  const blockId = matchedExpense
+  let blockId = matchedExpense
     ? matchedExpense.blockId
     : validBlockIds.has(String(raw.blockId))
     ? String(raw.blockId)
     : 'outras';
-  const boletoSubType =
+
+  if (!matchedExpense) {
+    if (detectedPix && !hasExplicitCreditCardSignal(allCombinedText)) {
+      // Force PIX into Boletos e Fixas (outras), NEVER into a credit card block!
+      blockId = 'outras';
+    } else if (!explicitCreditCard && blockId !== 'outras') {
+      // Only allow credit card blocks when credit card is explicitly indicated
+      blockId = 'outras';
+    }
+  }
+
+  const paymentMethodLabel =
+    blockId !== 'outras' || explicitCreditCard
+      ? 'Cartão de Crédito'
+      : detectedPix
+      ? 'PIX'
+      : raw.paymentMethod === 'boleto'
+      ? 'Boleto'
+      : 'PIX / Conta';
+
+  let boletoSubType: 'fixa' | 'mensal' | 'variavel' =
     raw.boletoSubType === 'fixa' || raw.boletoSubType === 'variavel'
       ? raw.boletoSubType
       : 'mensal';
+
+  if (totalInstallments && blockId === 'outras') {
+    boletoSubType = 'variavel';
+  }
+  // If user sent a one-off receipt like COPELDIS ("Luz") that did NOT match a fixed bill, ensure it goes to Gastos Mensais!
+  if (!matchedExpense && blockId === 'outras' && !totalInstallments && detectedPix) {
+    const descNorm = normalizeText(`${String(raw.description || '')} ${params.text || ''}`);
+    if (/\bcopel/.test(descNorm)) {
+      boletoSubType = 'mensal';
+    }
+  }
+
   const category = (ALLOWED_CATEGORIES as readonly string[]).includes(String(raw.category))
     ? String(raw.category)
     : matchedExpense
@@ -982,27 +1269,46 @@ async function parseAndSaveDirectToFirestore(params: {
       ? matchedExpense.amount
       : 0;
 
-  // Prefer user's caption if they explicitly typed a name like "Luz", or the matched expense name
-  let description = String(
+  // Build clean, non-duplicated description
+  let description =
     action === 'mark_existing_paid' && matchedExpense
       ? matchedExpense.description
-      : raw.description || params.text || 'Comprovante PIX'
-  ).slice(0, 75);
+      : cleanExpenseDescription(
+          String(raw.description || ''),
+          cleanExpenseDescription(params.text || audioTranscript, 'Comprovante PIX')
+        );
 
+  // If user attached a short label caption like "Luz" alongside a media receipt with payee "COPELDIS", combine cleanly as "Luz - COPELDIS"
   if (
+    params.mediaBase64 &&
+    !params.isAudio &&
     params.text &&
-    params.text.trim().length >= 2 &&
-    action !== 'mark_existing_paid' &&
-    !normalizeText(description).includes(normalizeText(params.text))
+    action !== 'mark_existing_paid'
   ) {
-    description = `${params.text.trim()} - ${description}`.slice(0, 75);
+    const cleanCaption = cleanExpenseDescription(params.text, '');
+    if (
+      cleanCaption.length >= 2 &&
+      !normalizeText(description).includes(normalizeText(cleanCaption)) &&
+      !normalizeText(cleanCaption).includes(normalizeText(description))
+    ) {
+      description = `${cleanCaption} - ${description}`.slice(0, 75);
+    }
   }
 
   const date =
     typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date)
       ? raw.date
-      : `${activeMonthKey}-${todayIso.slice(8, 10)}`;
-  const status = raw.status === 'Pendente' ? 'Pendente' : 'Pago';
+      : extractDueDateFromText(fallbackTextSource, activeMonthKey, todayIso);
+
+  const normFallback = normalizeText(fallbackTextSource);
+  const status: 'Pago' | 'Pendente' =
+    raw.status === 'Pendente' ||
+    (/\b(pendente|a\s+pagar|para\s+pagar|pra\s+pagar|vence|vencimento|falta\s+pagar|nao\s+paguei)\b/.test(
+      normFallback
+    ) &&
+      !/\b(paguei|pago|quitado)\b/.test(normFallback))
+      ? 'Pendente'
+      : 'Pago';
 
   const blockObj = blocks.find((b) => b.id === blockId);
   const destinationLabel =
@@ -1015,12 +1321,14 @@ async function parseAndSaveDirectToFirestore(params: {
       : boletoSubType === 'fixa'
       ? 'Boletos e Fixas → Despesas Fixas'
       : boletoSubType === 'variavel'
-      ? 'Boletos e Fixas → Despesas Variáveis'
+      ? 'Boletos e Fixas → Despesas Variáveis (Parceladas)'
       : 'Boletos e Fixas → Gastos Mensais';
 
   if (amount <= 0) {
     throw new Error(
-      'O valor (R$) não apareceu na imagem/print (o topo com o valor pode ter ficado cortado). Envie o print mostrando o valor ou digite junto na legenda (ex: "Luz 309,74").'
+      params.isAudio
+        ? `Não consegui identificar o valor no áudio${audioTranscript ? ` ("${audioTranscript.slice(0, 60)}")` : ''}. Fale o nome e o valor em reais.`
+        : 'Não consegui identificar o valor (R$) no comprovante. Envie o comprovante inteiro ou escreva o valor na legenda.'
     );
   }
 
@@ -1043,22 +1351,35 @@ async function parseAndSaveDirectToFirestore(params: {
           });
         } else if (action === 'mark_existing_paid' && matchedExpense) {
           expenses = expenses.map((e: Record<string, unknown>) =>
-            e.id === matchedExpense.id ? { ...e, status: 'Pago' } : e
+            e.id === matchedExpense.id
+              ? {
+                  ...e,
+                  status: 'Pago',
+                  notes: e.notes
+                    ? `${String(e.notes)} · Baixa ${paymentMethodLabel} via WhatsApp`
+                    : `Baixa ${paymentMethodLabel} via WhatsApp (${params.senderName})`,
+                }
+              : e
           );
         } else {
+          const noteParts = [
+            `${paymentMethodLabel} via WhatsApp${params.isAudio ? ' (Áudio)' : ''} (${params.senderName})`,
+            audioTranscript ? `"${audioTranscript.slice(0, 90)}"` : '',
+          ].filter(Boolean);
+
           expenses.push({
             id: `exp-wa-${Date.now()}`,
             description,
             dueDate: date,
-            currentInstallment: null,
-            totalInstallments: null,
+            currentInstallment,
+            totalInstallments,
             amount,
             status,
             blockId,
             category,
             isRecurringFixed: boletoSubType === 'fixa',
             boletoSubType,
-            notes: `Lançado via WhatsApp (${params.senderName})`,
+            notes: noteParts.join(' · ').slice(0, 180),
           });
         }
 
@@ -1069,7 +1390,11 @@ async function parseAndSaveDirectToFirestore(params: {
         };
       });
 
-      const lastActionText = `WhatsApp (${params.senderName}): ${description} (${formatBRLServer(amount)})`.slice(
+      const instLabel =
+        currentInstallment && totalInstallments
+          ? ` [${currentInstallment}/${totalInstallments}]`
+          : '';
+      const lastActionText = `WhatsApp (${params.senderName}): ${description}${instLabel} (${formatBRLServer(amount)} · ${status})`.slice(
         0,
         200
       );
@@ -1089,10 +1414,15 @@ async function parseAndSaveDirectToFirestore(params: {
 
   return {
     transactionType,
+    paymentMethodLabel,
     description,
     amount,
+    date,
     status,
+    currentInstallment,
+    totalInstallments,
     destinationLabel,
+    audioTranscript,
     savedToCloud,
   };
 }
@@ -1160,6 +1490,7 @@ export default async function handler(
             let mediaMimeType: string | undefined;
             let pdfExtractedText: string | undefined;
             let documentFilename: string | undefined;
+            let isAudio = false;
             let mediaDownloadError = '';
 
             if (msgType === 'text') {
@@ -1179,7 +1510,6 @@ export default async function handler(
               if ('base64' in media) {
                 mediaBase64 = media.base64;
                 mediaMimeType = media.mimeType;
-                pdfExtractedText = media.pdfExtractedText;
               } else {
                 mediaDownloadError = media.error;
               }
@@ -1203,6 +1533,24 @@ export default async function handler(
               } else {
                 mediaDownloadError = media.error;
               }
+            } else if (msgType === 'audio') {
+              isAudio = true;
+              const mediaId = String(msg?.audio?.id || '');
+              const [, media] = await Promise.all([
+                sendWhatsAppReadAndReaction({
+                  token,
+                  toPhone: fromPhone,
+                  messageId: incomingMsgId,
+                  emoji: '⏳',
+                }),
+                downloadWhatsAppMediaAsBase64(token, mediaId),
+              ]);
+              if ('base64' in media) {
+                mediaBase64 = media.base64;
+                mediaMimeType = media.mimeType;
+              } else {
+                mediaDownloadError = media.error;
+              }
             } else {
               await sendWhatsAppReadAndReaction({
                 token,
@@ -1211,7 +1559,7 @@ export default async function handler(
                 emoji: '⚠️',
               });
               const unsupportedMsg =
-                '⚠️ *Domus Finanças:* Formato não suportado. Envie uma imagem (PNG/JPG), PDF de comprovante PIX ou mensagem de texto com o valor (ex: *"Paguei 150,00 mercado"*).';
+                '⚠️ *Domus Finanças:* Formato não suportado. Envie texto, áudio, foto/print ou PDF de comprovante PIX (ex: *"Paguei 150,00 mercado"*, *"Pendente boleto 200,00 vence dia 15"* ou *"Cartão Nubank 3x de 100"*).';
               const replyRes = await sendWhatsAppTextReply(
                 token,
                 fromPhone,
@@ -1226,16 +1574,16 @@ export default async function handler(
             }
 
             if (!textContent && !mediaBase64) {
-              await sendWhatsAppReadAndReaction({
+              const reactRes = await sendWhatsAppReadAndReaction({
                 token,
                 toPhone: fromPhone,
                 messageId: incomingMsgId,
                 emoji: '❌',
               });
               const dlErrMsg = [
-                '❌ *Deu errado ao baixar o comprovante no Domus Finanças.*',
+                '❌ *Deu errado ao baixar o arquivo/áudio no Domus Finanças.*',
                 mediaDownloadError ? `• *Detalhe:* ${mediaDownloadError}` : '',
-                '💡 Tente reenviar a imagem PNG/JPG ou escreva o valor na legenda (ex: *"Paguei 150,00 mercado"*).',
+                '💡 Tente reenviar ou verifique se o Token da Meta no app precisa ser renovado.',
               ]
                 .filter(Boolean)
                 .join('\n');
@@ -1246,8 +1594,8 @@ export default async function handler(
                 incomingMsgId
               );
               await recordWebhookDiagnostic(
-                `ERR MÍDIA ${fromPhone}`,
-                `${mediaDownloadError || 'Sem conteúdo'} | Meta:${replyRes.details}`
+                `ERR MÍDIA ${fromPhone} (${msgType})`,
+                `${mediaDownloadError || 'Sem conteúdo'} | React:${reactRes.status} | Meta:${replyRes.details}`
               );
               continue;
             }
@@ -1255,20 +1603,28 @@ export default async function handler(
             try {
               const parsed = await parseAndSaveDirectToFirestore({
                 text: textContent || undefined,
-                imageBase64: mediaBase64,
-                imageMimeType: mediaMimeType,
+                mediaBase64,
+                mediaMimeType,
                 pdfExtractedText,
                 documentFilename,
+                isAudio,
                 senderName,
               });
 
+              const installmentLine =
+                parsed.currentInstallment && parsed.totalInstallments
+                  ? `• *Parcela:* ${parsed.currentInstallment}/${parsed.totalInstallments}`
+                  : '';
+
               const replySummary = [
                 '✅ *Lançamento Confirmado no Domus Finanças!*',
-                `• *Tipo:* ${parsed.transactionType === 'income' ? 'Entrada / Receita' : 'Saída / Pagamento'}`,
+                `• *Tipo:* ${parsed.transactionType === 'income' ? 'Entrada / Receita' : `Saída (${parsed.paymentMethodLabel})`}`,
                 `• *Descrição:* ${parsed.description}`,
                 `• *Valor:* ${formatBRLServer(parsed.amount)}`,
+                installmentLine,
                 `• *Local:* ${parsed.destinationLabel}`,
-                `• *Situação:* ${parsed.status}`,
+                `• *Situação:* ${parsed.status} (${parsed.date.split('-').reverse().join('/')})`,
+                parsed.audioTranscript ? `🎤 *Áudio ouvido:* "${parsed.audioTranscript.slice(0, 120)}"` : '',
                 parsed.savedToCloud
                   ? '☁️ *Já gravado automaticamente na planilha da família!*'
                   : '',
@@ -1276,7 +1632,7 @@ export default async function handler(
                 .filter(Boolean)
                 .join('\n');
 
-              const [, replyRes] = await Promise.all([
+              const [reactRes, replyRes] = await Promise.all([
                 sendWhatsAppReadAndReaction({
                   token,
                   toPhone: fromPhone,
@@ -1292,18 +1648,18 @@ export default async function handler(
               ]);
 
               await recordWebhookDiagnostic(
-                `OK ${fromPhone}: ${parsed.description} (${formatBRLServer(parsed.amount)})`,
-                `Cloud:${parsed.savedToCloud} | Mime:${mediaMimeType || 'text'} | Meta:${replyRes.details}`
+                `OK ${fromPhone}: ${parsed.description} (${formatBRLServer(parsed.amount)} · ${parsed.status})`,
+                `Cloud:${parsed.savedToCloud} | ${parsed.paymentMethodLabel} | Mime:${mediaMimeType || 'text'} | React:${reactRes.status} | Meta:${replyRes.details}`
               );
             } catch (err) {
               const errDetail = err instanceof Error ? err.message : 'valor não identificado';
               const errorReply = [
                 '❌ *Deu errado ao lançar no Domus Finanças.*',
                 `• *Motivo:* ${errDetail}`,
-                '💡 *Como resolver:* Envie um comprovante PIX mostrando o valor (R$) ou escreva o valor na legenda (ex: *"Luz 309,74"* ou *"Paguei 150,00 mercado"*).',
+                '💡 *Exemplos que funcionam:* *"Paguei 150,00 mercado"*, *"Pendente luz 120 vence dia 15"*, *"Compra crédito Nubank 6x de 80"*, áudio ou comprovante PIX.',
               ].join('\n');
 
-              const [, replyRes] = await Promise.all([
+              const [reactRes, replyRes] = await Promise.all([
                 sendWhatsAppReadAndReaction({
                   token,
                   toPhone: fromPhone,
@@ -1319,8 +1675,8 @@ export default async function handler(
               ]);
 
               await recordWebhookDiagnostic(
-                `ERR ${fromPhone}: "${textContent.slice(0, 35) || documentFilename || mediaMimeType || 'img'}"`,
-                `Err:${errDetail} | Meta:${replyRes.details}`
+                `ERR ${fromPhone}: "${textContent.slice(0, 35) || documentFilename || mediaMimeType || msgType}"`,
+                `Err:${errDetail} | React:${reactRes.status} | Meta:${replyRes.details}`
               );
             }
           }

@@ -34,6 +34,8 @@ export interface ParsedReceiptResult {
   totalInstallments: number | null;
   // Income fields
   person: 'Rodolfo' | 'Viviane' | 'Família';
+  // Optional audio transcription
+  transcript?: string | null;
   // Explanation shown to user
   confidenceNote: string;
   destinationLabel: string;
@@ -63,6 +65,107 @@ const DEFAULT_BLOCKS: ParserBlockOption[] = [
   { id: 'outras', shortName: 'Boletos e Fixas', fullTitle: 'Outras Despesas - Boletos e Fixas', group: 'boletos_pix' },
 ];
 
+const MODEL_CHAIN = [
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-3-flash-preview',
+];
+
+function normalizeText(str: string): string {
+  return String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+function hasExplicitCreditCardSignal(text: string): boolean {
+  const norm = normalizeText(text);
+  return /\b(cartao|cartao de credito|compra credito|compra no credito|credito a vista|credito parcelado|no credito|na funcao credito|fatura|mastercard|visa|elo|quero quero|quero_quero)\b/.test(
+    norm
+  );
+}
+
+function hasPixPaymentSignal(text: string): boolean {
+  const norm = normalizeText(text);
+  return /\b(pix|chave pix|comprovante pix|transferencia pix|pagamento pix|e2e|id\/transacao|id transacao|autenticacao pix)\b/.test(
+    norm
+  );
+}
+
+function extractInstallmentsFromText(rawText: string): {
+  currentInstallment: number | null;
+  totalInstallments: number | null;
+  isPerInstallmentAmount: boolean;
+} {
+  const norm = normalizeText(rawText);
+
+  const slashMatch = norm.match(/\b(?:parcela|parc\.?)?\s*(\d{1,2})\s*(?:\/|de)\s*(\d{1,2})\b/);
+  if (slashMatch) {
+    const curr = Number(slashMatch[1]);
+    const tot = Number(slashMatch[2]);
+    if (curr >= 1 && tot >= 2 && tot <= 120 && curr <= tot) {
+      const idx = slashMatch.index ?? 0;
+      const surrounding = norm.slice(Math.max(0, idx - 10), idx + slashMatch[0].length + 10);
+      if (!/\b(dia|vence|vencimento|em)\s+\d{1,2}\/\d{1,2}/.test(surrounding)) {
+        return { currentInstallment: curr, totalInstallments: tot, isPerInstallmentAmount: true };
+      }
+    }
+  }
+
+  const xDeMatch = norm.match(/\b(\d{1,2})\s*(?:x|vezes)\s*(?:de|x)\s*(?:r\$\s*)?\d+/);
+  if (xDeMatch) {
+    const tot = Number(xDeMatch[1]);
+    if (tot >= 2 && tot <= 120) {
+      return { currentInstallment: 1, totalInstallments: tot, isPerInstallmentAmount: true };
+    }
+  }
+
+  const xOnlyMatch = norm.match(/\b(?:em\s+|parcelad[oa]\s+em\s+|parcelad[oa]\s+)?(\d{1,2})\s*(?:x|vezes)\b/);
+  if (xOnlyMatch) {
+    const tot = Number(xOnlyMatch[1]);
+    if (tot >= 2 && tot <= 120) {
+      return { currentInstallment: 1, totalInstallments: tot, isPerInstallmentAmount: false };
+    }
+  }
+
+  return { currentInstallment: null, totalInstallments: null, isPerInstallmentAmount: false };
+}
+
+function extractDueDateFromText(rawText: string, activeMonthKey: string, todayIso: string): string {
+  const norm = normalizeText(rawText);
+  const fullDateMatch = rawText.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if (fullDateMatch) {
+    const d = Number(fullDateMatch[1]);
+    const m = Number(fullDateMatch[2]);
+    const yRaw = fullDateMatch[3];
+    if (d >= 1 && d <= 31 && m >= 1 && m <= 12) {
+      const year = yRaw
+        ? yRaw.length === 2
+          ? `20${yRaw}`
+          : yRaw
+        : activeMonthKey.slice(0, 4);
+      const isInstallmentContext = new RegExp(
+        `\\b(?:parcela|parc\\.?)\\s*${fullDateMatch[1]}/${fullDateMatch[2]}\\b`
+      ).test(norm);
+      if (!isInstallmentContext) {
+        return `${year}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      }
+    }
+  }
+
+  const dayMatch = norm.match(/\b(?:dia|vence(?:\s+dia)?|vencimento(?:\s+dia)?|para\s+dia|pro\s+dia)\s+(\d{1,2})\b/);
+  if (dayMatch) {
+    const d = Number(dayMatch[1]);
+    if (d >= 1 && d <= 31) {
+      return `${activeMonthKey}-${String(d).padStart(2, '0')}`;
+    }
+  }
+
+  return `${activeMonthKey}-${todayIso.slice(8, 10)}`;
+}
+
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -75,7 +178,7 @@ function getGeminiClient(): GoogleGenAI {
     apiVersion: 'v1beta',
     httpOptions: {
       apiVersion: 'v1beta',
-      timeout: 9000,
+      timeout: 18000,
       retryOptions: { attempts: 1 },
       headers: {
         'User-Agent': 'aistudio-build',
@@ -145,51 +248,48 @@ export async function parseFinancialReceiptOrMessage(params: {
       ? params.activeMonthKey
       : todayIso.slice(0, 7);
 
+  let effectiveText = params.text?.trim() || '';
+  const isAudio = Boolean(params.imageBase64 && params.imageMimeType?.startsWith('audio/'));
+
   const systemInstruction = `Você é o classificador financeiro automático do aplicativo Domus Finanças (controle financeiro familiar de Rodolfo e Viviane).
-Sua tarefa é analisar um comprovante de PIX (imagem ou PDF) e/ou uma mensagem curta de WhatsApp descrevendo uma saída (gasto/pagamento) ou entrada (receita/recebimento) e retornar exatamente os dados estruturados para lançar na planilha no local exato.
+Sua tarefa é analisar um comprovante de PIX (incluindo comprovantes VERTICAIS/COMPRIDOS do Santander, Sicredi, Bradesco, Nubank, Itaú), PDF bancário, áudio falado em português ou mensagem curta de WhatsApp e retornar os dados estruturados exatos.
 
-Regras de classificação:
+REGRAS CRÍTICAS:
 1. TIPO (transactionType):
-   - "income": quando o comprovante/mensagem indica dinheiro RECEBIDO (ex: "Pix recebido", "Recebi", "Salário", "Depósito", "Entrada", "Transferência recebida", "Freela", "Extra").
-   - "expense": quando indica dinheiro PAGO/GASTO (ex: "Pix enviado", "Comprovante de transferência/pagamento", "Paguei", "Gastei", "Comprei", "Boleto", "Fatura").
+   - "income": dinheiro RECEBIDO ("Pix recebido", "Recebi", "Salário", "Depósito", "Entrada", "Freela", "Extra").
+   - "expense": dinheiro PAGO/GASTO/A PAGAR ("Pix enviado", "Comprovante de pagamento", "Paguei", "Gastei", "Comprei", "Boleto", "Fatura", "Pendente").
 
-2. BAIXA EM CONTA EXISTENTE (action = "mark_existing_paid"):
-   - Compare o comprovante/mensagem com a lista de contas PENDENTES já cadastradas no mês.
-   - Se o valor e o destinatário/descrição corresponderem claramente a uma conta pendente já cadastrada (por exemplo, comprovante de pagamento da conta de Luz, Água, Internet, Escola, Consórcio ou parcela existente com valor igual ou muito próximo), defina action = "mark_existing_paid" e informe o ID exato em matchedExistingExpenseId.
-   - Caso seja um gasto novo do dia a dia ou não haja correspondência clara, defina action = "create" e matchedExistingExpenseId = "".
+2. LEITURA COMPLETA DE COMPROVANTES COMPRIDOS (ex: Santander):
+   - Leia a imagem INTEIRA do topo ao rodapé para pegar valor (R$), destinatário ("Para: ..."), pagador ("De: ...") e data.
 
-3. BLOCO / LOCAL EXATO (blockId e boletoSubType) para despesas:
-   - Se a mensagem ou comprovante mencionar explicitamente um cartão ou conta da lista disponível (ex: "NuBank", "Bradesco", "Santander", "Caixa", "Sicredi", "Quero Quero", etc.), use o "id" correspondente da lista de blocos disponíveis.
-   - Se for pagamento via PIX avulso, boleto, débito ou gasto comum sem cartão específico, use blockId = "outras" e escolha o subtipo exato em boletoSubType:
-     * "fixa": contas mensais recorrentes que nunca acabam (luz, energia, água, internet, celular, condomínio, aluguel, streaming, plano de saúde, escola mensal).
-     * "variavel": parcelamentos (ex: 3/12), consórcios, empréstimos, financiamentos, boletos parcelados.
-     * "mensal": gastos avulsos durante o mês (mercado, padaria, farmácia, gasolina, restaurante, feira, pix do dia a dia, compras à vista).
+3. DIFERENCIAÇÃO ESTRITA ENTRE PIX E CARTÃO DE CRÉDITO (paymentMethod e blockId):
+   - Se for um comprovante de PIX (mesmo emitido pelo banco Sicredi, Santander, Bradesco, Nubank ou Caixa), defina paymentMethod = "pix" e blockId = "outras" (Boletos e Fixas).
+   - NUNCA coloque um PIX no bloco de Cartão de Crédito só porque o nome do banco aparece no comprovante!
+   - SÓ defina paymentMethod = "credit_card" e o blockId do cartão (sicredi, nubank, bradesco, santander, quero_quero, caixa) se aparecer EXPLICITAMENTE: "compra crédito", "crédito à vista", "crédito parcelado", "cartão de crédito", "no cartão", "no crédito", "fatura", "Mastercard", "Visa", "Elo" ou "Quero Quero".
 
-4. STATUS:
-   - Se for um comprovante de PIX já efetivado ou mensagem no passado ("paguei", "fiz pix", "comprei"), status = "Pago".
-   - Se for uma conta futura/agendada ("boleto vence dia 20", "a pagar"), status = "Pendente".
+4. CONTA FIXA EXISTENTE vs GASTO AVULSO DO MÊS (action):
+   - Só use action = "mark_existing_paid" quando o destinatário/empresa E o valor corresponderem claramente a uma conta PENDENTE já cadastrada (ex: PIX para Fit Energia no valor parecido com a conta Fit Energia).
+   - Se o PIX for para OUTRA empresa ou OUTRO valor (ex: PIX para COPEL / COPELDIS com legenda "Luz", enquanto a conta fixa cadastrada é "Fit Energia" de outro valor), NÃO dê baixa na conta fixa! Use action = "create", blockId = "outras", boletoSubType = "mensal", status = "Pago" e descrição limpa como "Luz - COPELDIS".
 
-5. CATEGORIA:
+5. CONTAS PENDENTES E PARCELADAS:
+   - Se for conta pendente/a vencer ("pendente", "a pagar", "vence dia 15", "para dia 20/12"), defina status = "Pendente" e extraia a data de vencimento em date (YYYY-MM-DD).
+   - Se mencionar parcelamento ("em 5x de 120", "parcela 2/10", "parcelado em 6 vezes", "600 em 3x"), preencha currentInstallment e totalInstallments (se disser "600 em 3x", amount = 200). Em blockId = "outras", contas parceladas usam boletoSubType = "variavel".
+
+6. ÁUDIO:
+   - Se houver áudio, transcreva-o em "transcript" e extraia todos os campos financeiros.
+
+7. CATEGORIA:
    - Escolha ESTRITAMENTE uma das categorias permitidas: ${ALLOWED_CATEGORIES.join(' | ')}.
 
-6. PESSOA (para entradas):
-   - Escolha "Rodolfo", "Viviane" ou "Família". Se a mensagem não especificar e houver um remetente padrão, use-o ou "Família".
-
-7. DATA:
-   - Use formato YYYY-MM-DD. Se o comprovante mostrar a data do pagamento, extraia essa data. Se a mensagem não citar data, use ${todayIso}.
-
-8. VALOR:
-   - Retorne apenas o número positivo em reais (ex: 185.50). Se não houver valor legível, retorne 0.
-
-9. DESCRIÇÃO:
-   - Crie uma descrição limpa, curta e clara em português (ex: "PIX Mercado Atacadão", "Conta de Luz - Energisa", "Salário Extra Rodolfo"). Máximo 70 caracteres.`;
+8. DESCRIÇÃO:
+   - Curta, limpa e clara em português (máx. 70 chars), sem repetir palavras e sem colocar o valor na descrição.`;
 
   const contextLines = [
     `Data de hoje: ${todayIso}`,
     `Mês ativo na planilha: ${activeMonthKey}`,
     `Usuário logado/remetente padrão: ${params.defaultPerson || 'Família'}`,
     `Blocos disponíveis na planilha: ${JSON.stringify(blocks.map((b) => ({ id: b.id, nome: b.shortName, titulo: b.fullTitle })))}`,
-    `Contas PENDENTES já existentes neste mês (para possível baixa automática): ${JSON.stringify(
+    `Contas PENDENTES já existentes neste mês: ${JSON.stringify(
       existingExpenses
         .filter((e) => e.status === 'Pendente')
         .map((e) => ({
@@ -200,9 +300,11 @@ Regras de classificação:
           bloco: e.blockId,
         }))
     )}`,
-    params.text?.trim()
-      ? `Mensagem enviada pelo usuário: "${params.text.trim().slice(0, 1500)}"`
-      : 'O usuário enviou um comprovante sem texto adicional. Extraia todos os dados da imagem/documento.',
+    effectiveText
+      ? `Mensagem/Legenda enviada pelo usuário: "${effectiveText.slice(0, 1500)}"`
+      : isAudio
+      ? 'O usuário enviou um áudio em português. Transcreva em transcript e extraia todos os dados financeiros.'
+      : 'O usuário enviou um comprovante sem texto adicional. Extraia todos os dados da imagem/documento (do topo ao rodapé).',
   ].join('\n');
 
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
@@ -218,86 +320,43 @@ Regras de classificação:
 
   parts.push({ text: contextLines });
 
-  const modelChain = [
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-2.0-flash',
-    'gemini-3.1-flash-lite-preview',
-    'gemini-3-flash-preview',
-  ];
   let rawText = '';
   let lastModelErr: unknown;
 
-  for (const modelName of modelChain) {
+  for (const modelName of MODEL_CHAIN) {
     try {
+      const isGemini25 = modelName.startsWith('gemini-2.5');
       const response = await ai.models.generateContent({
         model: modelName,
         contents: { parts },
         config: {
           systemInstruction,
+          temperature: 0.1,
+          ...(isGemini25 ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              transactionType: {
-                type: Type.STRING,
-                description: 'Must be "expense" or "income"',
-              },
-              action: {
-                type: Type.STRING,
-                description: 'Must be "create" or "mark_existing_paid"',
-              },
-              matchedExistingExpenseId: {
-                type: Type.STRING,
-                description: 'Exact ID from existing pending expenses if action is mark_existing_paid, otherwise empty string',
-              },
-              description: {
-                type: Type.STRING,
-                description: 'Short clear Portuguese description of the transaction (max 70 chars)',
-              },
-              amount: {
-                type: Type.NUMBER,
-                description: 'Positive numeric value in BRL',
-              },
-              date: {
-                type: Type.STRING,
-                description: 'Transaction or due date in YYYY-MM-DD format',
-              },
-              status: {
-                type: Type.STRING,
-                description: 'Must be "Pago" or "Pendente"',
-              },
-              blockId: {
-                type: Type.STRING,
-                description: 'Exact id from the available blocks list, or "outras"',
-              },
-              boletoSubType: {
-                type: Type.STRING,
-                description: 'Must be "fixa", "mensal", or "variavel"',
-              },
-              category: {
-                type: Type.STRING,
-                description: 'Exact category from the allowed list',
-              },
-              currentInstallment: {
-                type: Type.INTEGER,
-                description: 'Current installment number if installment purchase, otherwise 0',
-              },
-              totalInstallments: {
-                type: Type.INTEGER,
-                description: 'Total installments if installment purchase, otherwise 0',
-              },
-              person: {
-                type: Type.STRING,
-                description: 'Must be "Rodolfo", "Viviane", or "Família"',
-              },
-              confidenceNote: {
-                type: Type.STRING,
-                description: 'One short sentence in Portuguese explaining how the receipt/message was read and classified',
-              },
+              transactionType: { type: Type.STRING },
+              paymentMethod: { type: Type.STRING },
+              action: { type: Type.STRING },
+              matchedExistingExpenseId: { type: Type.STRING },
+              description: { type: Type.STRING },
+              amount: { type: Type.NUMBER },
+              date: { type: Type.STRING },
+              status: { type: Type.STRING },
+              blockId: { type: Type.STRING },
+              boletoSubType: { type: Type.STRING },
+              category: { type: Type.STRING },
+              currentInstallment: { type: Type.INTEGER },
+              totalInstallments: { type: Type.INTEGER },
+              person: { type: Type.STRING },
+              transcript: { type: Type.STRING },
+              confidenceNote: { type: Type.STRING },
             },
             required: [
               'transactionType',
+              'paymentMethod',
               'action',
               'description',
               'amount',
@@ -319,22 +378,48 @@ Regras de classificação:
     }
   }
 
+  // Dedicated audio transcription fallback
+  if (!rawText && isAudio && params.imageBase64 && params.imageMimeType) {
+    try {
+      const transRes = await ai.models.generateContent({
+        model: 'gemini-3.5-transcribe',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: params.imageMimeType, data: params.imageBase64 } },
+            { text: 'Transcreva exatamente o que foi falado em português brasileiro.' },
+          ],
+        },
+      });
+      const transcript = (transRes.text ?? '').trim();
+      if (transcript) {
+        effectiveText = effectiveText ? `${effectiveText} ${transcript}` : transcript;
+      }
+    } catch (err) {
+      lastModelErr = err;
+    }
+  }
+
   let parsed: Record<string, unknown>;
   if (rawText) {
     try {
-      parsed = JSON.parse(rawText);
+      const firstBrace = rawText.indexOf('{');
+      const lastBrace = rawText.lastIndexOf('}');
+      parsed = JSON.parse(
+        firstBrace !== -1 && lastBrace > firstBrace
+          ? rawText.slice(firstBrace, lastBrace + 1)
+          : rawText
+      );
     } catch {
       throw new Error('A resposta de leitura do comprovante veio em formato inesperado.');
     }
-  } else if (params.text?.trim()) {
-    const norm = params.text
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .toLowerCase()
-      .trim();
-    const cleaned = params.text
+  } else if (effectiveText) {
+    const norm = normalizeText(effectiveText);
+    const inst = extractInstallmentsFromText(effectiveText);
+    const cleaned = effectiveText
       .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, ' ')
-      .replace(/\b\d{4}-\d{2}-\d{2}\b/g, ' ');
+      .replace(/\b\d{4}-\d{2}-\d{2}\b/g, ' ')
+      .replace(/\b(?:dia|vence(?:\s+dia)?|vencimento(?:\s+dia)?|para\s+dia)\s+\d{1,2}\b/gi, ' ')
+      .replace(/\b(\d{1,2})\s*(?:x|vezes)\b/gi, ' ');
     const brlMatches = cleaned.match(
       /(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{1,2}|\d+,\d{1,2}|\d+\.\d{2}|\b\d+(?:\b|$))/gi
     );
@@ -351,42 +436,87 @@ Regras de classificação:
         }
       }
     }
+    if (
+      extractedAmount > 0 &&
+      inst.totalInstallments &&
+      inst.totalInstallments >= 2 &&
+      !inst.isPerInstallmentAmount &&
+      !/\bde\s*(?:r\$\s*)?\d+/.test(norm)
+    ) {
+      extractedAmount = Math.round((extractedAmount / inst.totalInstallments) * 100) / 100;
+    }
     const isIncome =
       /\b(recebi|recebido|entrada|salario|pro-labore|pro labore|ganhei|depilacao|azilo|freela|renda)\b/.test(
         norm
       );
+    const isPending = /\b(pendente|vence|vencimento|agendado|a pagar|falta pagar)\b/.test(norm);
+    const isCredit = hasExplicitCreditCardSignal(effectiveText);
+    const isPix = hasPixPaymentSignal(effectiveText);
+    let fallbackBlock = 'outras';
+    if (isCredit && !isPix) {
+      for (const blk of blocks) {
+        if (blk.id === 'outras') continue;
+        const blkNorm = normalizeText(blk.shortName);
+        if ((blkNorm && norm.includes(blkNorm)) || norm.includes(blk.id.replace('_', ' '))) {
+          fallbackBlock = blk.id;
+          break;
+        }
+      }
+    }
     parsed = {
       transactionType: isIncome ? 'income' : 'expense',
+      paymentMethod: isCredit ? 'credit_card' : isPix ? 'pix' : 'debit_cash',
       action: 'create',
       matchedExistingExpenseId: '',
-      description: params.text.trim().slice(0, 70),
+      description: effectiveText.slice(0, 70),
       amount: extractedAmount,
-      date: todayIso,
-      status: 'Pago',
-      blockId: 'outras',
-      boletoSubType: 'mensal',
-      category: 'Outros & Jurídico',
+      date: extractDueDateFromText(effectiveText, activeMonthKey, todayIso),
+      status: isPending ? 'Pendente' : 'Pago',
+      blockId: fallbackBlock,
+      boletoSubType: inst.totalInstallments ? 'variavel' : 'mensal',
+      category: fallbackBlock !== 'outras' ? 'Financeiro & Cartões' : 'Outros & Jurídico',
+      currentInstallment: inst.currentInstallment ?? 0,
+      totalInstallments: inst.totalInstallments ?? 0,
       person: params.defaultPerson || 'Família',
+      transcript: isAudio ? effectiveText : '',
       confidenceNote: 'Classificado automaticamente pelo motor financeiro do Domus.',
     };
   } else {
     throw lastModelErr instanceof Error
       ? lastModelErr
-      : new Error('Não foi possível extrair os dados do comprovante ou mensagem.');
+      : new Error('Não foi possível extrair os dados do comprovante, áudio ou mensagem.');
   }
 
   const validBlockIds = new Set(blocks.map((b) => b.id));
   const transactionType: 'expense' | 'income' =
     parsed.transactionType === 'income' ? 'income' : 'expense';
+  const isPending = parsed.status === 'Pendente';
 
   const rawMatchedId =
     typeof parsed.matchedExistingExpenseId === 'string'
       ? parsed.matchedExistingExpenseId.trim()
       : '';
-  const matchedExpense =
-    transactionType === 'expense' && rawMatchedId
+  let matchedExpense =
+    transactionType === 'expense' && !isPending && rawMatchedId
       ? existingExpenses.find((e) => e.id === rawMatchedId && e.status === 'Pendente') || null
       : null;
+
+  const amountNum = Number(parsed.amount);
+  const safeAmount =
+    Number.isFinite(amountNum) && amountNum > 0
+      ? Math.round(amountNum * 100) / 100
+      : matchedExpense && matchedExpense.amount > 0
+      ? matchedExpense.amount
+      : 0;
+
+  // Reject mismatched fixed bill match (e.g. COPEL vs Fit Energia)
+  if (matchedExpense && safeAmount > 0 && matchedExpense.amount > 0) {
+    const diff = Math.abs(matchedExpense.amount - safeAmount);
+    const pct = diff / Math.max(matchedExpense.amount, safeAmount);
+    if (diff > 15 && pct > 0.2) {
+      matchedExpense = null;
+    }
+  }
 
   const action: 'create' | 'mark_existing_paid' =
     matchedExpense && parsed.action === 'mark_existing_paid'
@@ -394,12 +524,45 @@ Regras de classificação:
       : 'create';
 
   const rawBlockId = typeof parsed.blockId === 'string' ? parsed.blockId.trim() : 'outras';
-  const blockId = validBlockIds.has(rawBlockId) ? rawBlockId : 'outras';
+  let blockId = validBlockIds.has(rawBlockId) ? rawBlockId : 'outras';
+
+  const combinedText = `${effectiveText} ${String(parsed.transcript || '')} ${String(parsed.description || '')} ${String(parsed.confidenceNote || '')}`;
+  const paymentMethod = String(parsed.paymentMethod || '').toLowerCase();
+  const explicitCredit =
+    paymentMethod === 'credit_card' || hasExplicitCreditCardSignal(combinedText);
+  const isPix = paymentMethod === 'pix' || hasPixPaymentSignal(combinedText);
+
+  if (!matchedExpense && blockId !== 'outras' && (isPix || !explicitCredit)) {
+    blockId = 'outras';
+  }
+
+  const fallbackInst = extractInstallmentsFromText(`${effectiveText} ${String(parsed.transcript || '')}`);
+  const currInstNum = Number(parsed.currentInstallment);
+  const totInstNum = Number(parsed.totalInstallments);
+  let currentInstallment =
+    Number.isInteger(currInstNum) && currInstNum >= 1
+      ? currInstNum
+      : fallbackInst.currentInstallment;
+  let totalInstallments =
+    Number.isInteger(totInstNum) && totInstNum >= 2
+      ? totInstNum
+      : fallbackInst.totalInstallments;
+  if (totalInstallments && (!currentInstallment || currentInstallment > totalInstallments)) {
+    currentInstallment = 1;
+  }
+  if (!totalInstallments || totalInstallments < 2) {
+    currentInstallment = null;
+    totalInstallments = null;
+  }
+
+  const hasInstallments = Boolean(currentInstallment && totalInstallments);
 
   const boletoSubType: 'fixa' | 'mensal' | 'variavel' =
-    parsed.boletoSubType === 'fixa' ||
-    parsed.boletoSubType === 'mensal' ||
-    parsed.boletoSubType === 'variavel'
+    hasInstallments && blockId === 'outras'
+      ? 'variavel'
+      : parsed.boletoSubType === 'fixa' ||
+        parsed.boletoSubType === 'mensal' ||
+        parsed.boletoSubType === 'variavel'
       ? parsed.boletoSubType
       : 'mensal';
 
@@ -415,17 +578,10 @@ Regras de classificação:
       ? params.defaultPerson
       : 'Família';
 
-  const amountNum = Number(parsed.amount);
-  const safeAmount = Number.isFinite(amountNum) && amountNum > 0 ? Math.round(amountNum * 100) / 100 : 0;
-
-  const currInstNum = Number(parsed.currentInstallment);
-  const totInstNum = Number(parsed.totalInstallments);
-  const hasInstallments =
-    Number.isInteger(currInstNum) &&
-    Number.isInteger(totInstNum) &&
-    currInstNum > 0 &&
-    totInstNum > 0 &&
-    currInstNum <= totInstNum;
+  const transcript =
+    typeof parsed.transcript === 'string' && parsed.transcript.trim()
+      ? parsed.transcript.trim().slice(0, 220)
+      : null;
 
   const baseResult: Omit<ParsedReceiptResult, 'destinationLabel'> = {
     transactionType,
@@ -433,23 +589,28 @@ Regras de classificação:
     matchedExistingExpenseId: matchedExpense ? matchedExpense.id : null,
     matchedExistingDescription: matchedExpense ? matchedExpense.description : null,
     description:
-      typeof parsed.description === 'string' && parsed.description.trim()
+      matchedExpense
+        ? matchedExpense.description
+        : typeof parsed.description === 'string' && parsed.description.trim()
         ? parsed.description.trim().slice(0, 75)
         : transactionType === 'income'
         ? 'Entrada via PIX'
         : 'Pagamento via PIX',
     amount: safeAmount,
     date: sanitizeDate(parsed.date, activeMonthKey),
-    status: parsed.status === 'Pendente' ? 'Pendente' : 'Pago',
+    status: isPending ? 'Pendente' : 'Pago',
     blockId: matchedExpense ? matchedExpense.blockId : blockId,
-    boletoSubType: hasInstallments ? 'variavel' : boletoSubType,
+    boletoSubType,
     category,
-    currentInstallment: hasInstallments ? currInstNum : null,
-    totalInstallments: hasInstallments ? totInstNum : null,
+    currentInstallment,
+    totalInstallments,
     person,
+    transcript,
     confidenceNote:
       typeof parsed.confidenceNote === 'string' && parsed.confidenceNote.trim()
         ? parsed.confidenceNote.trim().slice(0, 220)
+        : transcript
+        ? `Áudio transcrito: "${transcript}"`
         : 'Lançamento identificado automaticamente.',
   };
 

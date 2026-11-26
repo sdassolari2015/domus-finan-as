@@ -17,6 +17,10 @@ import {
   Trash2,
   QrCode,
   RefreshCw,
+  Mic,
+  Square,
+  Volume2,
+  AlertTriangle,
 } from 'lucide-react';
 import { doc, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
 import { db, HOUSEHOLD_ID } from '../services/firebase';
@@ -24,9 +28,7 @@ import {
   AccountBlockId,
   BoletoSubType,
   ExpenseCategory,
-  ExpenseItem,
   FamilyMember,
-  IncomeItem,
   MonthLedger,
 } from '../types/finance';
 import { getEffectiveBlocks } from '../data/initialData';
@@ -47,6 +49,7 @@ export interface ParsedReceiptPayload {
   currentInstallment: number | null;
   totalInstallments: number | null;
   person: FamilyMember;
+  transcript?: string | null;
   confidenceNote: string;
   destinationLabel: string;
 }
@@ -144,8 +147,25 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
     Array<{ id: string; description: string; notes: string }>
   >([]);
   const [isResettingQr, setIsResettingQr] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const tokenInputRef = useRef<HTMLInputElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!isOpen && isRecording) {
+      mediaRecorderRef.current?.stop();
+      setIsRecording(false);
+      if (recordingTimerRef.current) {
+        window.clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+    }
+  }, [isOpen, isRecording]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -198,29 +218,123 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
       'image/webp',
       'image/heic',
       'application/pdf',
+      'audio/ogg',
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/mp4',
+      'audio/m4a',
+      'audio/x-m4a',
+      'audio/wav',
+      'audio/webm',
+      'audio/aac',
+      'audio/opus',
     ];
-    const mime = file.type.toLowerCase();
+    const rawMime = (file.type || '').toLowerCase().split(';')[0].trim();
+    let mime = rawMime;
+    if (!mime && file.name) {
+      const ext = file.name.toLowerCase().split('.').pop();
+      if (ext === 'ogg' || ext === 'opus') mime = 'audio/ogg';
+      else if (ext === 'mp3') mime = 'audio/mpeg';
+      else if (ext === 'm4a') mime = 'audio/mp4';
+      else if (ext === 'wav') mime = 'audio/wav';
+      else if (ext === 'webm') mime = 'audio/webm';
+    }
     if (!allowed.includes(mime)) {
-      setErrorMsg('Envie uma imagem (PNG, JPG, WEBP) ou PDF do comprovante PIX.');
+      setErrorMsg('Envie uma imagem (PNG, JPG, WEBP), PDF ou Áudio (OGG, MP3, M4A, WAV).');
       return;
     }
     if (file.size > 7 * 1024 * 1024) {
-      setErrorMsg('Arquivo muito grande. Envie um comprovante de até 7 MB.');
+      setErrorMsg('Arquivo muito grande. Envie um arquivo de até 7 MB.');
       return;
     }
+    const normalizedMime =
+      mime === 'image/jpg'
+        ? 'image/jpeg'
+        : mime === 'audio/mp3'
+        ? 'audio/mpeg'
+        : mime === 'audio/m4a' || mime === 'audio/x-m4a'
+        ? 'audio/mp4'
+        : mime === 'audio/opus'
+        ? 'audio/ogg'
+        : mime;
     const reader = new FileReader();
     reader.onload = () => {
       const dataUrl = String(reader.result || '');
       const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
       setAttachmentPreview({
-        name: file.name || 'comprovante-pix',
-        mimeType: mime === 'image/jpg' ? 'image/jpeg' : mime,
+        name: file.name || (normalizedMime.startsWith('audio/') ? 'audio-lancamento' : 'comprovante-pix'),
+        mimeType: normalizedMime,
         base64,
         dataUrl,
       });
       setErrorMsg(null);
     };
     reader.readAsDataURL(file);
+  };
+
+  const handleToggleAudioRecording = async () => {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      setIsRecording(false);
+      if (recordingTimerRef.current) {
+        window.clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+      return;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setErrorMsg('Seu navegador não permite gravar áudio aqui. Você pode anexar um arquivo de áudio ou enviar direto no WhatsApp.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const preferredTypes = ['audio/webm', 'audio/ogg', 'audio/mp4'];
+      const supportedType =
+        preferredTypes.find((t) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) ||
+        '';
+      const recorder = supportedType
+        ? new MediaRecorder(stream, { mimeType: supportedType })
+        : new MediaRecorder(stream);
+
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          audioChunksRef.current.push(ev.data);
+        }
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const finalMime = (recorder.mimeType || supportedType || 'audio/webm').split(';')[0].trim();
+        const blob = new Blob(audioChunksRef.current, { type: finalMime });
+        if (blob.size === 0) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = String(reader.result || '');
+          const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+          setAttachmentPreview({
+            name: `Áudio gravado (${recordingSeconds || 1}s)`,
+            mimeType: finalMime,
+            base64,
+            dataUrl,
+          });
+          setErrorMsg(null);
+        };
+        reader.readAsDataURL(blob);
+      };
+
+      mediaRecorderRef.current = recorder;
+      setRecordingSeconds(0);
+      setIsRecording(true);
+      setErrorMsg(null);
+      recorder.start();
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingSeconds((prev) => prev + 1);
+      }, 1000);
+    } catch {
+      setErrorMsg('Não foi possível acessar o microfone. Permita o uso do microfone no navegador ou envie o áudio pelo WhatsApp.');
+    }
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -394,6 +508,7 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
 
   const handleSendTestWhatsApp = async () => {
     const cleanPhone = testPhoneInput.replace(/\D/g, '');
+    const cleanToken = newTokenInput.replace(/\s+/g, '').trim();
     if (!cleanPhone || cleanPhone.length < 10) {
       setTestResultMsg({
         ok: false,
@@ -409,10 +524,26 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           to: cleanPhone,
-          newAccessToken: newTokenInput.trim() || undefined,
+          newAccessToken: cleanToken || undefined,
         }),
       });
-      const data = await res.json();
+      const rawText = await res.text();
+      let data: {
+        ok?: boolean;
+        tokenSaved?: boolean;
+        deliveredAny?: boolean;
+        metaTokenValid?: boolean;
+        error?: string;
+        attempts?: Array<{ response?: { error?: { message?: string } } }>;
+      } = {};
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        throw new Error(
+          'O servidor retornou uma resposta inesperada. Atualize a página e tente novamente.'
+        );
+      }
+
       // Refresh status banner
       fetch('/api/whatsapp/status')
         .then((r) => (r.ok ? r.json() : null))
@@ -421,7 +552,16 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
         })
         .catch(() => {});
 
-      if (data?.ok) {
+      if (data?.tokenSaved && data?.metaTokenValid) {
+        setNewTokenInput('');
+        setTestResultMsg({
+          ok: true,
+          text: data.deliveredAny
+            ? '✅ Token Permanente salvo na nuvem, validado na Meta e mensagem de teste enviada! Já pode mandar comprovantes e áudios no WhatsApp.'
+            : '✅ Token Permanente salvo na nuvem e validado na Meta! As reações (✅/❌), leitura de comprovantes e áudios já estão 100% ativos no seu WhatsApp.',
+        });
+        onShowToast('✅ Token Permanente salvo e ativado no WhatsApp!');
+      } else if (data?.ok) {
         setNewTokenInput('');
         setTestResultMsg({
           ok: true,
@@ -430,9 +570,9 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
         onShowToast('Mensagem de teste enviada para seu WhatsApp!');
       } else {
         const firstErr =
-          Array.isArray(data?.attempts) && data.attempts[0]?.response?.error?.message
-            ? data.attempts[0].response.error.message
-            : data?.error || 'A Meta recusou o envio.';
+          data?.error ||
+          (Array.isArray(data?.attempts) && data.attempts[0]?.response?.error?.message) ||
+          'A Meta recusou o token ou o envio.';
         setTestResultMsg({
           ok: false,
           text: `Retorno da Meta: ${firstErr}`,
@@ -441,7 +581,7 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
     } catch (err) {
       setTestResultMsg({
         ok: false,
-        text: err instanceof Error ? err.message : 'Erro ao testar envio.',
+        text: err instanceof Error ? err.message : 'Erro ao salvar/testar o token.',
       });
     } finally {
       setIsSendingTest(false);
@@ -449,10 +589,10 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
   };
 
   const quickExamples = [
-    'Paguei 185,50 no mercado hoje via PIX',
-    'Cartão NuBank 149,90 farmácia',
+    'Paguei 185,50 no mercado via PIX',
+    'Pendente boleto 250,00 vence dia 20',
+    'Compra crédito NuBank 6x de 120,00',
     'Recebi 850,00 extra do Rodolfo',
-    'PIX 210,00 conta de luz',
   ];
 
   return (
@@ -538,6 +678,33 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {/* Expired Meta Token Warning Banner (visible on both tabs) */}
+          {waStatus?.metaTokenValid === false && (
+            <div className="p-3.5 bg-red-50 border border-red-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 text-xs text-red-900">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <strong className="block text-red-950">
+                    Token Temporário (24h) da Meta Expirado — Reações (✅/❌) e Mídias Pausadas
+                  </strong>
+                  <p className="text-[11px] leading-relaxed">
+                    As mensagens de texto continuam lançando, mas a Meta bloqueou o download de comprovantes/áudios e as reações com emoji até renovar o token.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveSubTab('connect');
+                  window.setTimeout(() => tokenInputRef.current?.focus(), 120);
+                }}
+                className="px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white text-xs font-bold rounded-lg whitespace-nowrap shrink-0"
+              >
+                Renovar Token Agora
+              </button>
+            </div>
+          )}
+
           {activeSubTab === 'inbox' ? (
             <>
               {/* Pending items arriving directly from connected real WhatsApp number */}
@@ -628,6 +795,10 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                       <span className="text-slate-500 block text-[11px]">Data &amp; Categoria</span>
                       <strong className="text-slate-900">
                         {formatDateBR(pendingReview.parsed.date)} · {pendingReview.parsed.category}
+                        {pendingReview.parsed.currentInstallment &&
+                        pendingReview.parsed.totalInstallments
+                          ? ` · Parcela ${pendingReview.parsed.currentInstallment}/${pendingReview.parsed.totalInstallments}`
+                          : ''}
                       </strong>
                     </div>
                   </div>
@@ -677,6 +848,10 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                           <div className="w-12 h-12 rounded-lg bg-red-50 border border-red-200 flex items-center justify-center shrink-0">
                             <FileText className="w-6 h-6 text-red-600" />
                           </div>
+                        ) : attachmentPreview.mimeType.startsWith('audio/') ? (
+                          <div className="w-12 h-12 rounded-lg bg-emerald-100 border border-emerald-300 flex items-center justify-center shrink-0">
+                            <Volume2 className="w-6 h-6 text-emerald-700" />
+                          </div>
                         ) : (
                           <img
                             src={attachmentPreview.dataUrl}
@@ -689,7 +864,9 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                             {attachmentPreview.name}
                           </p>
                           <p className="text-[11px] text-emerald-700 font-medium">
-                            Comprovante PIX pronto para leitura automática
+                            {attachmentPreview.mimeType.startsWith('audio/')
+                              ? 'Áudio pronto para transcrição e lançamento automático'
+                              : 'Comprovante pronto para leitura automática'}
                           </p>
                         </div>
                       </div>
@@ -710,24 +887,47 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                         </div>
                         <div>
                           <p className="text-xs font-bold text-slate-900">
-                            Anexar Comprovante PIX (Print, Foto ou PDF)
+                            Anexar Comprovante (Print, Foto, PDF) ou Gravar Áudio
                           </p>
                           <p className="text-[11px] text-slate-500">
-                            No PC você também pode dar <strong className="font-mono">Ctrl+V</strong> direto em um print copiado do WhatsApp
+                            Reconhece comprovantes compridos (Santander/Sicredi), <strong className="font-mono">Ctrl+V</strong> de prints e áudios falados
                           </p>
                         </div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        className="px-3.5 py-2 bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 rounded-lg text-xs font-bold whitespace-nowrap shrink-0"
-                      >
-                        Escolher Arquivo
-                      </button>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => void handleToggleAudioRecording()}
+                          className={`px-3 py-2 rounded-lg text-xs font-bold whitespace-nowrap flex items-center gap-1.5 border transition-colors ${
+                            isRecording
+                              ? 'bg-red-600 hover:bg-red-700 text-white border-red-700'
+                              : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border-emerald-300'
+                          }`}
+                        >
+                          {isRecording ? (
+                            <>
+                              <Square className="w-3.5 h-3.5 fill-current" />
+                              <span>Parar ({recordingSeconds}s)</span>
+                            </>
+                          ) : (
+                            <>
+                              <Mic className="w-3.5 h-3.5" />
+                              <span>Gravar Áudio</span>
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          className="px-3 py-2 bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 rounded-lg text-xs font-bold whitespace-nowrap"
+                        >
+                          Escolher Arquivo
+                        </button>
+                      </div>
                       <input
                         ref={fileInputRef}
                         type="file"
-                        accept="image/*,application/pdf"
+                        accept="image/*,application/pdf,audio/*"
                         onChange={handleFileInputChange}
                         className="hidden"
                       />
@@ -816,9 +1016,15 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                               {formatCurrency(entry.parsed.amount)}
                             </span>
                           </div>
-                          <div className="text-[11px] text-emerald-900 font-medium flex items-center gap-1.5">
+                          <div className="text-[11px] text-emerald-900 font-medium flex items-center gap-1.5 flex-wrap">
                             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-                            <span>Lançado em: {entry.parsed.destinationLabel}</span>
+                            <span>
+                              Lançado em: {entry.parsed.destinationLabel}
+                              {entry.parsed.status === 'Pendente' ? ' (Pendente)' : ''}
+                              {entry.parsed.currentInstallment && entry.parsed.totalInstallments
+                                ? ` · Parcela ${entry.parsed.currentInstallment}/${entry.parsed.totalInstallments}`
+                                : ''}
+                            </span>
                           </div>
                           <div className="text-[11px] text-slate-500">
                             {entry.timestamp} · {entry.parsed.confidenceNote}
@@ -1081,10 +1287,11 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                   Atualizar Token da Meta e Testar no seu WhatsApp Agora
                 </label>
                 <input
+                  ref={tokenInputRef}
                   type="password"
                   value={newTokenInput}
                   onChange={(e) => setNewTokenInput(e.target.value)}
-                  placeholder="Se o token expirou, cole aqui o novo Token da Meta (EAA...) para atualizar sem ir na Vercel"
+                  placeholder="Cole aqui o novo Token da Meta (EAA...) para reativar reações (✅/❌), comprovantes e áudios"
                   className="w-full px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg"
                 />
                 <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
@@ -1125,6 +1332,27 @@ export const WhatsAppPixModal: React.FC<WhatsAppPixModalProps> = ({
                     {testResultMsg.text}
                   </div>
                 )}
+
+                {/* Permanent Token Guide so emoji reactions never expire after 24h */}
+                <div className="pt-2.5 mt-2 border-t border-slate-200 space-y-1.5 text-[11px] text-slate-600">
+                  <p className="font-bold text-slate-800">
+                    Dica: Como criar um Token Permanente (que NUNCA expira em 24h):
+                  </p>
+                  <ol className="list-decimal pl-4 space-y-1">
+                    <li>
+                      Acesse <strong>business.facebook.com</strong> → <strong>Configurações do Negócio</strong> → <strong>Usuários do sistema</strong> → clique em <strong>Adicionar</strong> (nome: <em>Domus</em>, função: <em>Administrador</em>).
+                    </li>
+                    <li>
+                      Clique em <strong>Atribuir ativos</strong> → selecione seu app do WhatsApp com controle total.
+                    </li>
+                    <li>
+                      Clique em <strong>Gerar novo token</strong> → escolha validade <strong>Nunca expira</strong> e marque <code>whatsapp_business_messaging</code> e <code>whatsapp_business_management</code>.
+                    </li>
+                    <li>
+                      Cole o token permanente gerado (<code>EAA...</code>) na caixa acima e clique em <strong>Salvar Token e Testar</strong> (as reações ✅/❌ e leitura de áudios/comprovantes ficam ativas para sempre!).
+                    </li>
+                  </ol>
+                </div>
               </div>
 
               {/* Webhook URL to paste in Meta */}
