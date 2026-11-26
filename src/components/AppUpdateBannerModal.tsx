@@ -11,7 +11,7 @@ import {
   APP_RELEASES,
   AppReleaseNote,
   CURRENT_APP_VERSION,
-  getAcknowledgedVersion,
+  setAcknowledgedVersion,
   checkRemoteVersionJson,
   applyInPlaceAppUpdate,
 } from '../data/appVersion';
@@ -32,10 +32,7 @@ export const AppUpdateBannerModal: React.FC<AppUpdateBannerModalProps> = ({
   onCloseExternalModal,
 }) => {
   const [latestRelease, setLatestRelease] = useState<AppReleaseNote>(APP_RELEASES[0]);
-  const [hasPendingUpdate, setHasPendingUpdate] = useState<boolean>(() => {
-    const ack = getAcknowledgedVersion();
-    return ack !== CURRENT_APP_VERSION;
-  });
+  const [hasPendingUpdate, setHasPendingUpdate] = useState<boolean>(false);
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [isUpdating, setIsUpdating] = useState<boolean>(false);
   const [justUpdatedSuccess, setJustUpdatedSuccess] = useState<boolean>(false);
@@ -46,18 +43,20 @@ export const AppUpdateBannerModal: React.FC<AppUpdateBannerModalProps> = ({
     }
   }, [externalOpenModal]);
 
-  // Real-time cloud version sync + /version.json check so iPhone, other PCs, and Notebook .bat detect updates automatically without changing the link or reinstalling
+  // Real-time cloud version sync + /version.json check so devices only prompt when a newer version is actually available
   useEffect(() => {
     let mounted = true;
+    setAcknowledgedVersion(CURRENT_APP_VERSION);
 
     void publishCurrentVersionToCloud();
 
     const unsubCloudVer = subscribeToCloudAppVersion((cloudRelease) => {
       if (!mounted) return;
       setLatestRelease(cloudRelease);
-      const ack = getAcknowledgedVersion();
-      if (ack !== cloudRelease.version) {
+      if (cloudRelease.version !== CURRENT_APP_VERSION) {
         setHasPendingUpdate(true);
+      } else {
+        setHasPendingUpdate(false);
       }
     });
 
@@ -78,10 +77,8 @@ export const AppUpdateBannerModal: React.FC<AppUpdateBannerModalProps> = ({
         } catch {
           // Ignore sessionStorage errors
         }
-      }
-      const ack = getAcknowledgedVersion();
-      if (ack !== remote.version) {
-        setHasPendingUpdate(true);
+      } else {
+        setHasPendingUpdate(false);
       }
     };
 

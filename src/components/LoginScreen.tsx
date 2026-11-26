@@ -14,6 +14,8 @@ import {
 import { FamilyMember } from '../types/finance';
 import {
   signInWithGooglePopup,
+  signInWithGoogleRedirect,
+  completeGoogleRedirectIfNeeded,
   submitGoogleAccessRequest,
 } from '../services/firebase';
 import {
@@ -81,7 +83,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
   useEffect(() => {
     void ensureStandaloneOfflineCache();
-  }, []);
+    void completeGoogleRedirectIfNeeded().then((user) => {
+      if (user) {
+        void onGoogleAuthCompleted();
+      }
+    });
+  }, [onGoogleAuthCompleted]);
 
   useEffect(() => {
     setRequestJustSent(false);
@@ -98,6 +105,22 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         typeof err === 'object' && err !== null && 'code' in err
           ? String((err as { code?: unknown }).code || '')
           : '';
+      const isTopLevelWindow =
+        typeof window !== 'undefined' && window.self === window.top;
+
+      if (
+        isTopLevelWindow &&
+        (code === 'auth/popup-blocked' ||
+          code === 'auth/operation-not-supported-in-this-environment')
+      ) {
+        try {
+          await signInWithGoogleRedirect();
+          return;
+        } catch {
+          // Fall through to error message below
+        }
+      }
+
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
         setErrorMsg('Login cancelado. Clique novamente em "Entrar com Conta Google" para continuar.');
       } else if (code === 'auth/popup-blocked') {
@@ -105,10 +128,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       } else if (code === 'auth/unauthorized-domain') {
         const host = typeof window !== 'undefined' ? window.location.hostname : 'domus-finan-as.vercel.app';
         setErrorMsg(
-          `Domínio "${host}" ainda não liberado no Firebase Authentication. No Firebase Console (Authentication → Settings → Authorized domains), adicione "${host}" para liberar o login Google neste endereço.`
+          `Domínio "${host}" ainda não está na lista de Domínios Autorizados do Firebase (projeto nimble-might-65wls). Adicione "${host}" em Authentication → Settings → Authorized domains para liberar o login.`
         );
       } else {
-        setErrorMsg('Não foi possível concluir o login com o Google agora. Verifique sua conexão e tente novamente.');
+        setErrorMsg(
+          `Não foi possível concluir o login com o Google agora${code ? ` (${code})` : ''}. Verifique sua conexão e tente novamente.`
+        );
       }
     } finally {
       setIsAuthenticating(false);
